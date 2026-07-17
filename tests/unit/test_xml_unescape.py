@@ -10,6 +10,8 @@ for _key in list(sys.modules):
             hasattr(_mod, "__file__") and _mod.__file__ and "<stub" in str(_mod.__file__)
         ):
             del sys.modules[_key]
+        elif _key == "utils" and not hasattr(_mod, "unescape_xml"):
+            del sys.modules[_key]
 
 from utils import unescape_xml
 

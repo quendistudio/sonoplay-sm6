@@ -3,24 +3,24 @@
 import importlib
 import sys
 import types
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
-
-def _make_stub(name):
-    mod = types.ModuleType(name)
-    mod.__path__ = []
-    mod.__file__ = f"<stub {name}>"
-    mod.__getattr__ = lambda attr: MagicMock()
-    return mod
+ROOT = Path(__file__).resolve().parents[2]
 
 
-for _name in ["dotmap", "starlette", "starlette.datastructures", "utils"]:
-    if _name not in sys.modules:
-        sys.modules[_name] = _make_stub(_name)
+def _ensure_plex_package_stub() -> None:
+    """Load plex.play_queue without executing plex/__init__.py (FastAPI side effects)."""
+    plex_pkg = sys.modules.get("plex")
+    if plex_pkg is None or not getattr(plex_pkg, "__path__", None):
+        plex_pkg = types.ModuleType("plex")
+        plex_pkg.__path__ = [str(ROOT / "plex")]
+        sys.modules["plex"] = plex_pkg
 
-sys.modules["utils"].g = MagicMock()
+
+_ensure_plex_package_stub()
 
 sys.modules.pop("plex.play_queue", None)
 play_queue = importlib.import_module("plex.play_queue")
