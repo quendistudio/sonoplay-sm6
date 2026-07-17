@@ -1,13 +1,13 @@
 """Version and startup banner for SonoPlay."""
 
-VERSION = "1.2.1"
+VERSION = "1.2.1-sm6.84"
 LICENSE = "GPL-3.0"
 PRODUCT = "SonoPlay"
 
 
 def print_banner() -> None:
 
-    banner = f"""
+    banner = r"""
 ╔════════════════════════════════════════════════════╗
 ║   ____                    ____  _                  ║
 ║  / ___|  ___  _ __   ___ |  _ \| | _____  __       ║
@@ -15,7 +15,7 @@ def print_banner() -> None:
 ║   ___) | (_) | | | | (_) |  __/| |  __/>  <        ║
 ║  |____/ \___/|_| |_|\___/|_|   |_|\___/_/\_\       ║
 ║                                                    ║
-║  Version: v1.2.1          License: GPL-3.0         ║
+║  Version: v1.2.1-sm6.84   License: GPL-3.0         ║
 ╚════════════════════════════════════════════════════╝
 """
     print(banner)

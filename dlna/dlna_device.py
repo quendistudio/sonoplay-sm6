@@ -418,6 +418,7 @@ class DlnaDevice(object):
         self.location_url = location_url
         self.name = None
         self.manufacturer = None
+        self.model_name = None
         self.model = None
         self.ip = None
         self.info = None
@@ -425,6 +426,7 @@ class DlnaDevice(object):
         self.volume_max = None
         self.volume_min = None
         self.volume_step = None
+        self._volume_range_cached = False
         self.uuid = None
         self.loop = asyncio.get_running_loop()
         self.repeat_error_count = 0
@@ -442,6 +444,7 @@ class DlnaDevice(object):
                 device_info = self.info['device']
                 self.name = as_text(device_info.get('friendlyName'))
                 self.manufacturer = as_text(device_info.get('manufacturer'))
+                self.model_name = as_text(device_info.get('modelName'))
                 model_desc = device_info.get('modelDescription', settings.product)
                 self.model = as_text(model_desc, settings.product)
                 udn = as_text(device_info.get('UDN'))
@@ -498,8 +501,8 @@ class DlnaDevice(object):
             url = urlparse(self.location_url)
             self.ip = url.hostname
             self.name = settings.dlna_name_alias(self.uuid, self.name, self.ip)
-            await self.get_volume_info()
             await asyncio.gather(*[s.get_spec() for s in self.services.values()])
+            await self._cache_volume_range()
 
     async def _find_service_by_action(self, action):
         await self.get_data()
@@ -518,6 +521,30 @@ class DlnaDevice(object):
         if data is None:
             data = {}
         await self.get_data()
+
+        if action in ("SetVolume", "SetMute"):
+            from plex.device_profiles import is_sm6_like
+
+            if is_sm6_like(self):
+                from dlna.sm6_rendering_control import sm6_set_mute, sm6_set_volume
+                from utils import DotMap
+
+                payload = data if isinstance(data, dict) else {}
+                if not isinstance(data, dict):
+                    if action == "SetVolume":
+                        payload = {"DesiredVolume": data}
+                    else:
+                        payload = {"DesiredMute": data}
+                if action == "SetVolume":
+                    desired = payload.get("DesiredVolume", 0)
+                    if await sm6_set_volume(self, int(desired)):
+                        return DotMap()
+                    return None
+                muted = bool(int(payload.get("DesiredMute", 0)))
+                if await sm6_set_mute(self, muted):
+                    return DotMap()
+                return None
+
         service = None
         if service_type is not None:
             service = self._get_service(service_type)
@@ -615,24 +642,46 @@ class DlnaDevice(object):
             service.subscribed = False
 
     async def get_volume_info(self):
+        """Ensure RenderingControl volume range is cached from SCPD."""
         await self.get_data()
+        if not self._volume_range_cached:
+            await self._cache_volume_range()
+
+    async def _cache_volume_range(self):
+        """Parse Volume allowedValueRange from RenderingControl SCPD (once per device)."""
+        if self._volume_range_cached:
+            return
         self.volume_min = 0
         self.volume_max = 100
         self.volume_step = 1
         service = self._get_service(UPNP_RC_SERVICE_TYPE)
-        try:
-            vars = await service.get_state_variables()
-            for v in vars:
-                if as_text(v.get('name')) == "Volume":
-                    r = v.get('allowedValueRange')
-                    if not r:
+        if service is not None:
+            try:
+                for v in await service.get_state_variables():
+                    if as_text(v.get("name")) != "Volume":
                         continue
-                    self.volume_min = int(as_text(r.get('minimum'), 0))
-                    self.volume_max = int(as_text(r.get('maximum'), 100))
-                    self.volume_step = int(as_text(r.get('step'), 1))
+                    r = v.get("allowedValueRange")
+                    if not r:
+                        break
+                    self.volume_min = int(as_text(r.get("minimum"), 0))
+                    self.volume_max = int(as_text(r.get("maximum"), 100))
+                    self.volume_step = int(as_text(r.get("step"), 1))
                     break
-        except Exception:
-            logger.exception("Unexpected error parsing volume range")
+            except Exception:
+                logger.exception("Unexpected error parsing volume range for %s", self.name)
+        self._volume_range_cached = True
+        logger.info(
+            "%s RenderingControl volume range cached: %s..%s (step %s)",
+            self.name,
+            self.volume_min,
+            self.volume_max,
+            self.volume_step,
+        )
+
+    def volume_range(self):
+        from dlna.sm6_volume import VolumeRange
+
+        return VolumeRange.from_device(self)
 
     async def remove_self(self):
         async with devices_lock:
@@ -672,19 +721,7 @@ async def get_device_data():
 
 
 async def get_device_by_uuid(uuid):
-    async with devices_lock:
-        for device in devices:
-            if device.uuid == uuid:
-                # Release lock before async operation
-                break
-        else:
-            device = None
-    
-    if device is not None:
-        await device.get_data()
-        return device
-    
-    # Fallback to virtual devices
+    # Plex virtual group (same UUID as SM6 member): prefer the virtual one.
     try:
         from dlna.virtual import get_virtual_device_by_uuid
 
@@ -692,7 +729,18 @@ async def get_device_by_uuid(uuid):
         if virtual_device is not None:
             return virtual_device
     except Exception:
-        # Avoid breaking physical device lookup if virtual module fails
         pass
+
+    async with devices_lock:
+        for device in devices:
+            if device.uuid == uuid:
+                break
+        else:
+            device = None
+
+    if device is not None:
+        await device.get_data()
+        return device
+
     logger.debug("device uuid not found: %s", uuid)
     return None

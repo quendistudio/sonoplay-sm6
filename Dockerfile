@@ -40,6 +40,11 @@ COPY settings/ settings/
 COPY utils/ utils/
 COPY src/ src/
 
+# ffmpeg: Plex HLS → progressive MP3 for SM6
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 # Set ownership
 RUN chown -R sonoplay:sonoplay /app
 

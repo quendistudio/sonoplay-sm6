@@ -1,7 +1,9 @@
+import os
+
 from logging_config import configure_logging
 from version import print_banner
 
-configure_logging()
+configure_logging(os.environ.get("LOG_LEVEL", "INFO"))
 print_banner()
 
 from plex.plexserver import start_plex_server

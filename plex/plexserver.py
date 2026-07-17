@@ -121,6 +121,17 @@ async def handle_device_unreachable(request: Request, exc: ClientConnectionError
 
 
 async def on_new_dlna_device(location_url):
+    from dlna.reject_cache import is_permanent_reject, is_rejected, normalize_location_url, remember_rejection
+    from dlna.sm6_rendering_control import is_sm6_proxy_url
+    from plex.runtime_cache import is_probable_plex_dlna_url, remember_plex_dlna_device_url
+
+    location_url = normalize_location_url(location_url)
+    if is_rejected(location_url):
+        return
+
+    if is_probable_plex_dlna_url(location_url):
+        remember_plex_dlna_device_url(location_url)
+
     logger.info("got new dlna device location url %s", location_url)
     for d in devices:
         if d.location_url == location_url:
@@ -129,8 +140,35 @@ async def on_new_dlna_device(location_url):
     try:
         await device.get_data()
     except Exception as exc:
-        logger.warning("failed to init dlna device from %s: %s", location_url, exc)
+        if is_permanent_reject(exc):
+            remember_rejection(
+                location_url,
+                reason=str(exc),
+                name=getattr(device, "name", None),
+            )
+        else:
+            logger.warning("failed to init dlna device from %s: %s", location_url, exc)
         return
+
+    for existing in devices:
+        if existing.uuid != device.uuid:
+            continue
+        if is_sm6_proxy_url(location_url) and not is_sm6_proxy_url(existing.location_url):
+            logger.info(
+                "ignoring duplicate SM6 SSDP proxy %s (keeping native %s)",
+                location_url,
+                existing.location_url,
+            )
+            return
+        if not is_sm6_proxy_url(location_url) and is_sm6_proxy_url(existing.location_url):
+            logger.info(
+                "replacing SM6 proxy entry %s with native %s",
+                existing.location_url,
+                location_url,
+            )
+            devices.remove(existing)
+            break
+
     logger.info("got new dlna device from %s", device.name)
     asyncio.create_task(device.loop_subscribe(), name=f"dlna sub {device.name}")
     devices.append(device)
@@ -247,12 +285,22 @@ async def on_shutdown():
             logger.debug("Error stopping GDM instance", exc_info=True)
     _gdm_instances.clear()
     stop_tasks = []
+    from plex.device_profiles import needs_plex_dlna_stream_url
+
     for device in devices:
         adapter = await adapter_by_device(device)
-        # Only stop playback this bridge started (it has an active queue);
-        # don't silence speakers playing from other sources on restart.
         if adapter.queue is not None:
-            stop_tasks.append(adapter.stop())
+            if needs_plex_dlna_stream_url(device):
+                logger.info(
+                    "%s shutdown — end Plex session without SM6 command",
+                    device.name,
+                )
+                adapter.queue = None
+                adapter.current_track_info = None
+                adapter._sm6_session_uri = None
+                adapter.state.update(state="STOPPED", uri=None)
+            else:
+                stop_tasks.append(adapter.stop())
         stop_tasks.append(device.remove_self())
     await asyncio.gather(*stop_tasks)
     if g.http:
@@ -701,6 +749,62 @@ async def dlna_subscribe(request: Request, uuid: str):
     return ""
 
 
+@s.get("/player/stream/transcode.mp3")
+async def stream_transcode_mp3(
+    request: Request,
+    ratingKey: str = Query(..., min_length=1),
+):
+    """
+    Complete CBR MP3 for SM6: one ffmpeg job per track, shared by parallel GETs.
+    """
+    from fastapi.responses import FileResponse
+
+    from plex.mp3_transcode_cache import ensure_transcoded_mp3, ffmpeg_path
+    from plex.transcode_stream import resolve_pms_source_url_for_rating_key
+
+    await guess_host_ip(request)
+    key = ratingKey.strip()
+    if not key.isdigit():
+        raise HTTPException(status_code=400, detail="invalid ratingKey")
+
+    if not ffmpeg_path():
+        raise HTTPException(status_code=503, detail="ffmpeg not available")
+
+    cbr_kbps = settings.audio_transcode_proxy_kbps
+    source_url = await resolve_pms_source_url_for_rating_key(key)
+    if not source_url:
+        raise HTTPException(status_code=503, detail="Plex source unavailable")
+
+    logger.info(
+        "SM6 transcode proxy encode ratingKey=%s cbr=%s kbps source=%s",
+        key,
+        cbr_kbps,
+        source_url.split("?", 1)[0],
+    )
+
+    try:
+        mp3_path = await ensure_transcoded_mp3(
+            key,
+            source_url=source_url,
+            cbr_kbps=cbr_kbps,
+        )
+    except RuntimeError as exc:
+        logger.warning("SM6 transcode proxy failed ratingKey=%s: %s", key, exc)
+        raise HTTPException(status_code=503, detail="transcode failed") from exc
+
+    size = mp3_path.stat().st_size
+    return FileResponse(
+        mp3_path,
+        media_type="audio/mpeg",
+        filename=f"{key}.mp3",
+        headers={
+            "Content-Length": str(size),
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "private, max-age=3600",
+        },
+    )
+
+
 @s.get("/player/playback/playMedia")
 async def play_media(request: Request,
                      commandID: int,
@@ -713,6 +817,7 @@ async def play_media(request: Request,
                      client_uuid: str = Header(None, alias="x-plex-client-identifier")):
     require_valid_uuid(target_uuid)
     await guess_host_ip(request)
+    logger.info("playMedia key=%s containerKey=%s device=%s", key, containerKey, target_uuid)
     sub_man.update_command_id(target_uuid, client_uuid, commandID)
     device = await get_device_by_uuid(target_uuid)
     if device is None:
@@ -865,8 +970,10 @@ async def set_parameters(commandID: int,
                          shuffle: int = None,
                          repeat: int = None,
                          volume: float = None,
+                         mute: int = None,
                          target_uuid: str = Header(None, alias="x-plex-target-client-identifier"),
-                         client_uuid: str = Header(None, alias="x-plex-client-identifier")):
+                         client_uuid: str = Header(None, alias="x-plex-client-identifier"),
+                         plex_product: str = Header(None, alias="x-plex-product")):
     require_valid_uuid(target_uuid)
     sub_man.update_command_id(target_uuid, client_uuid, commandID)
     if type_ == 'music':
@@ -875,11 +982,38 @@ async def set_parameters(commandID: int,
             raise HTTPException(404, f"device not found {target_uuid}")
         adapter = await adapter_by_device(device)
         if shuffle is not None:
-            adapter.shuffle = shuffle
+            await adapter.set_shuffle(shuffle)
         if repeat is not None:
-            adapter.queue.repeat = repeat
+            await adapter.set_repeat(repeat)
+        if mute is not None:
+            logger.info("setParameters mute=%s target=%s", mute, target_uuid)
+            await adapter.set_mute(bool(int(mute)))
         if volume is not None:
-            await adapter.set_volume(int(volume))
+            from plex.plex_client import resolve_sm6_volume_for_client
+
+            if adapter._is_sm6_renderer():
+                await adapter._sm6_refresh_volume_from_device()
+                if adapter._sm6_should_ignore_volume_write(int(volume)):
+                    return await build_response("", target_uuid=target_uuid)
+            device_step = None
+            if adapter._is_sm6_renderer():
+                device_step = await adapter._sm6_read_device_step()
+            plex_volume, sm6_step = resolve_sm6_volume_for_client(
+                adapter,
+                int(volume),
+                client_uuid=client_uuid,
+                product=plex_product,
+                device_step=device_step,
+            )
+            logger.info(
+                "setParameters volume=%s target=%s client=%s product=%r step=%s",
+                plex_volume,
+                target_uuid,
+                client_uuid,
+                plex_product,
+                sm6_step,
+            )
+            await adapter.set_volume(plex_volume, sm6_step=sm6_step)
     return await build_response("", target_uuid=target_uuid)
 
 
@@ -891,9 +1025,13 @@ async def timeline_poll(request: Request,
                         commandID: int,
                         wait: int = 0,
                         target_uuid: str = Header(None, alias="x-plex-target-client-identifier"),
-                        client_uuid: str = Header(None, alias="x-plex-client-identifier")):
+                        client_uuid: str = Header(None, alias="x-plex-client-identifier"),
+                        plex_product: str = Header(None, alias="x-plex-product")):
     require_valid_uuid(target_uuid)
     global _waiting_poll_count
+    from plex.plex_client import note_client_product
+
+    note_client_product(client_uuid, plex_product)
     async with _poll_lock:
         _waiting_poll_count += 1
         current_count = _waiting_poll_count
@@ -908,10 +1046,16 @@ async def timeline_poll(request: Request,
             raise HTTPException(404, f"device not found {target_uuid}")
         if hasattr(device, "loop_subscribe"):
             asyncio.create_task(device.loop_subscribe())
-        adapter = await adapter_by_device(device)
+        adapter = await adapter_by_device(device, request.query_params)
+        if adapter._is_sm6_renderer() and not await adapter._sm6_should_skip_volume_poll():
+            now = time.monotonic()
+            last = getattr(adapter, "_sm6_volume_timeline_refresh_at", 0.0)
+            if now - last >= 8.0:
+                adapter._sm6_volume_timeline_refresh_at = now
+                await adapter._sm6_refresh_volume_from_device()
         if wait == 1:
-            await adapter.wait_for_event(settings.plex_notify_interval * 20, interesting_fields=[
-                'state', 'volume', 'current_uri', 'elapsed_jump'])
+            await adapter.wait_for_event(settings.plex_notify_interval * 10, interesting_fields=[
+                'state', 'volume', 'muted', 'current_uri', 'elapsed_jump', 'shuffle', 'repeat'])
         msg = await sub_man.msg_for_device(device)
         while msg is None:
             logger.debug(f"Waiting for message: {target_uuid}")
@@ -933,9 +1077,13 @@ async def subscribe(request: Request,
                     port: int,
                     protocol: str = "http",
                     target_uuid: str = Header(None, alias="x-plex-target-client-identifier"),
-                    client_uuid: str = Header(None, alias="x-plex-client-identifier")):
+                    client_uuid: str = Header(None, alias="x-plex-client-identifier"),
+                    plex_product: str = Header(None, alias="x-plex-product")):
     require_valid_uuid(target_uuid)
     await guess_host_ip(request)
+    from plex.plex_client import note_client_product
+
+    note_client_product(client_uuid, plex_product)
     device = await get_device_by_uuid(target_uuid)
     if device is None:
         raise HTTPException(404, f"device not found {target_uuid}")

@@ -1,6 +1,9 @@
-# ── Documentation & Tests (managed outside repo) ──
+# ── Documentation (managed outside repo) ──
 docs/
-tests/
+
+# ── Local scratch / logs pasted for debugging (never commit) ──
+.temp/
+tests/fixtures/private/
 
 # ── Python artifacts ──
 __pycache__/
@@ -72,3 +75,7 @@ docker-compose.override.yml
 # ── Misc loose root files ──
 start.sh
 .git.bak/
+
+# ── Cursor files ──
+.cursor/
+.cursorignore

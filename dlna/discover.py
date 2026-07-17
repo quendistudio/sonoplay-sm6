@@ -113,7 +113,12 @@ class DlnaDiscover(object):
             del self._recently_seen_locations[loc]
 
     async def on_new_device(self, location_url):
+        from dlna.reject_cache import is_rejected, normalize_location_url
+
+        location_url = normalize_location_url(location_url)
         if not location_url:
+            return
+        if is_rejected(location_url):
             return
         # Skip if currently being processed
         if location_url in self._pending_locations:

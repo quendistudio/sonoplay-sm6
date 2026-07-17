@@ -108,6 +108,10 @@ class Settings(BaseSettings):
     # and max 48kHz sample rate. CD quality is 1411 kbps at 44.1kHz.
     audio_transcode_threshold_kbps: int | None = 1500  # Safe default for most DLNA
     audio_transcode_max_sample_rate_hz: int | None = 48000  # Max for Sonos/most DLNA
+    # Target output bitrate when Plex transcodes (musicBitrate); not the trigger threshold.
+    audio_transcode_target_kbps: int = 320
+    # SM6 proxy: constant MP3 bitrate (256, then 192 or 128 if buffering issues).
+    audio_transcode_proxy_kbps: int = 256
     
     # HTTP timeout settings (in seconds)
     http_timeout_default: float = 10.0  # Default timeout for all requests
@@ -120,10 +124,54 @@ class Settings(BaseSettings):
     dlna_subscribe_timeout: int = 120   # DLNA event subscription timeout
     adapter_idle_interval: int = 60     # Seconds between state checks when idle
     pin_cache_max_size: int = 100       # Maximum cached Plex PIN login entries
+    log_level: str = "INFO"
+    plex_dlna_device_url: str | None = None
+    plex_dlna_port: int | None = None
+    plex_pms_port: int = 32400
+    plex_pms_token: str | None = None
+    plex_music_library_key: str | None = None
+    plex_dlna_musique_id: str | None = None
+    plex_dlna_music_folder_id: str | None = None
+    sm6_plex_navigator_name: str | None = None
+    sm6_plex_navigator_id: str | None = None
+    sm6_plex_navigator_auto_register: bool = True
+    sm6_volume_debounce_seconds: float = 0.1
+    # SM6 playback polling: plexupnp-like cadence (1–2 s), no SOAP burst.
+    sm6_poll_playing_interval_seconds: float = 1.0
+    sm6_poll_transport_every_cycles: int = 2
+    sm6_poll_position_every_cycles: int = 2
+    sm6_poll_volume_every_cycles: int = 4
+    sm6_poll_mute_every_cycles: int = 4
+    sm6_poll_playlist_every_cycles: int = 4
+    sm6_transport_hold_seconds: float = 0.2
+    # Minimum threshold (ms) to wake Plex long-poll — never applied to the position value.
+    sm6_position_plex_notify_min_delta_ms: int = 1000
+    sm6_position_assume_play_delay_seconds: float = 0.1
+    sm6_position_assume_skip_delay_seconds: float = 0.35
+    sm6_position_resync_back_tolerance_ms: int = 500
+    sm6_optimistic_play_seconds: float = 2.5
+    sm6_play_timeline_push_interval_seconds: float = 0.25
+    sm6_plexamp_volume_step_enabled: bool = True
+    sm6_plexamp_volume_step_max_delta: int = 8
 
     def __init__(self, **values):
         super().__init__(**values)
         object.__setattr__(self, "_data_cache", None)
+
+    def resolved_plex_dlna_device_url(self) -> str | None:
+        """Plex DLNA DeviceDescription URL: env → SSDP cache → HOST_IP + port."""
+        if self.plex_dlna_device_url:
+            return self.plex_dlna_device_url
+        from plex.runtime_cache import cached_plex_dlna_device_url
+
+        cached = cached_plex_dlna_device_url()
+        if cached:
+            return cached
+        if self.host_ip and self.plex_dlna_port:
+            return (
+                f"http://{self.host_ip}:{self.plex_dlna_port}/DeviceDescription.xml"
+            )
+        return None
 
     def dlna_name_alias(self, uuid: str, name: str, ip: str):
         data = self.load_data()

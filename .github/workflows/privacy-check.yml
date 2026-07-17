@@ -1,0 +1,26 @@
+name: Privacy check
+
+on:
+  push:
+    branches: [main, master, dev, stable]
+  pull_request:
+
+jobs:
+  private-data:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Scan for private deployment data
+        run: python scripts/check_private_data.py
+
+      - name: Install test dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Run unit tests
+        run: |
+          python -m pytest tests/unit/test_play_queue.py tests/unit/test_track_key_match.py tests/unit/test_audio_settings.py tests/unit/test_xml_unescape.py -q

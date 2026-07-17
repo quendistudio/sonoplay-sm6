@@ -426,10 +426,17 @@ class VirtualDlnaDevice:
     async def Seek(self, position: str, client=None):
         return await self._fan_out("Seek", position, client=client)
 
+    async def _sm6_set_member_volume(self, device, device_volume: int) -> bool:
+        from dlna.sm6_rendering_control import sm6_set_volume
+
+        return await sm6_set_volume(device, device_volume)
+
     async def SetVolume(self, volume_value: int, client=None):
         from plex.adapters import adapter_by_device  # local import to avoid cycle
         from dlna.virtual.volume import map_volume_to_device
-        
+        from plex.device_profiles import is_legacy_cambridge_stream_magic
+        from dlna.sm6_volume import VolumeRange, plex_to_dlna_level
+
         resolved, _ = await self._resolve_members()
         active_devices = self._filter_active_devices(resolved)
         if not active_devices:
@@ -449,8 +456,21 @@ class VirtualDlnaDevice:
         try:
             coros = []
             for device in active_devices:
-                # For heterogeneous groups, use member_capabilities for volume mapping
-                if self.is_heterogeneous and device.uuid in self.member_capabilities:
+                v_min = getattr(device, "volume_min", 0) or 0
+                v_max = getattr(device, "volume_max", 100) or 100
+                if is_legacy_cambridge_stream_magic(device):
+                    volume_range = VolumeRange.from_device(device)
+                    device_volume = plex_to_dlna_level(volume_value, volume_range)
+                    logger.info(
+                        "virtual group %s: SM6 SetVolume Plex=%s%% -> DesiredVolume=%s member=%s",
+                        self.name,
+                        volume_value,
+                        device_volume,
+                        device.name,
+                    )
+                    coros.append(self._sm6_set_member_volume(device, device_volume))
+                    continue
+                elif self.is_heterogeneous and device.uuid in self.member_capabilities:
                     caps = self.member_capabilities[device.uuid]
                     device_volume = map_volume_to_device(
                         volume_value,
@@ -1025,17 +1045,22 @@ def capability_signature(device: "DlnaDevice") -> str:
 
 
 async def _resolve_physical_members(member_uuids: Iterable[str]) -> List["DlnaDevice"]:
+    from dlna.sm6_rendering_control import pick_sm6_control_device
     from dlna.dlna_device import devices as physical_devices
 
-    resolved: List["DlnaDevice"] = []
     requested = list(dict.fromkeys(member_uuids))  # preserve order, remove duplicates
     by_uuid = {device.uuid: device for device in physical_devices}
+    resolved: List["DlnaDevice"] = []
     for member_uuid in requested:
-        device = by_uuid.get(member_uuid)
-        if device is None:
-            raise UnknownMemberError(member_uuid)
-        await device.get_data()
-        resolved.append(device)
+        matches = [device for device in physical_devices if device.uuid == member_uuid]
+        if not matches:
+            device = by_uuid.get(member_uuid)
+            if device is None:
+                raise UnknownMemberError(member_uuid)
+            matches = [device]
+        for device in pick_sm6_control_device(matches):
+            await device.get_data()
+            resolved.append(device)
     return resolved
 
 

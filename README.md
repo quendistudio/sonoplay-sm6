@@ -1,4 +1,10 @@
-# SonoPlay
+# SonoPlay SM6
+
+This is a fork of SonoPlay for Cambridge Audio Stream Magic 6. It supports the SM6's specific requirements regarding controls and playback management, particularly for features related to Reciva radio and remote control.
+
+Thank you to aquantumofdonuts for maintaining SonoPlay and to songchenwen for creating the original version of Plex DLNA Player.
+
+# Original README from SonoPlay
 
 Bridge Plexamp to DLNA/UPnP renderers on your local network.
 
@@ -95,15 +101,17 @@ pip install -r requirements.txt
 python main.py
 ```
 
-Run tests:
+Run tests and privacy scan before opening a PR:
 
 ```bash
-python3 -m pytest tests/ -q
+pip install -e ".[dev]"
+python scripts/check_private_data.py
+python -m pytest tests/unit -q
 ```
 
 ## Contributing
 
-Issues and PRs are welcome.
+Issues and PRs are welcome. Do not commit personal deployment data: Plex tokens, private IPs/hostnames, real library titles or rating keys, or logs from `.temp/`. Use fictional fixtures under `tests/fixtures/` for examples.
 
 ## Credits
 
