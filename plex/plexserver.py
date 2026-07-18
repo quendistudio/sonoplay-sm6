@@ -1092,6 +1092,8 @@ async def timeline_poll(request: Request,
             if now - last >= 8.0:
                 adapter._sm6_volume_timeline_refresh_at = now
                 await adapter._sm6_refresh_volume_from_device()
+        if wait == 1 and hasattr(adapter, "_sm6_sync_timeline_for_poll"):
+            await adapter._sm6_sync_timeline_for_poll()
         if wait == 1:
             await adapter.wait_for_event(settings.plex_notify_interval * 10, interesting_fields=[
                 'state', 'volume', 'muted', 'current_uri', 'elapsed_jump', 'shuffle', 'repeat'])

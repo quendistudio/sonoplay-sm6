@@ -1678,8 +1678,8 @@ class PlexDlnaAdapter(object):
         rating_key = await self._sm6_rating_key_for_uri(uri)
         if not rating_key:
             return
-        metadata = await self.plex_lib.fetch_metadata(f"/library/metadata/{rating_key}")
-        if metadata is None:
+        old_key = getattr(self.current_track_info, "ratingKey", None)
+        if str(old_key) == str(rating_key) and uri == self._sm6_session_uri:
             return
         if self.queue is not None:
             key = f"/library/metadata/{rating_key}"
@@ -1689,19 +1689,20 @@ class PlexDlnaAdapter(object):
                     self.dlna.name,
                     rating_key,
                 )
-        track = metadata
-        old_key = getattr(self.current_track_info, "ratingKey", None)
-        if str(old_key) == str(getattr(track, "ratingKey", "")) and uri == self._sm6_session_uri:
-            return
-        self.current_track_info = track
+            await self._sm6_bind_current_track_to_queue()
+        else:
+            metadata = await self.plex_lib.fetch_metadata(f"/library/metadata/{rating_key}")
+            if metadata is None:
+                return
+            self.current_track_info = metadata
         self._sm6_session_uri = uri
         logger.info(
             "%s SM6 sync Plex queue -> %s (ratingKey=%s)",
             self.dlna.name,
-            getattr(track, "title", "?"),
+            getattr(self.current_track_info, "title", "?"),
             rating_key,
         )
-        self._sm6_publish_track_change(track, uri=uri)
+        self._sm6_publish_track_change(self.current_track_info, uri=uri)
 
     def _sm6_passive_sync_blocked(self) -> bool:
         """True while Plex playMedia owns the adapter — passive SM6 sync must yield."""
@@ -2139,12 +2140,8 @@ class PlexDlnaAdapter(object):
             and track_id == self._sm6_last_queue_track_id
         )
         if same_track:
-            if queue_index >= 0 and self.queue is not None:
-                plex_offset = self._sm6_queue_base_offset + queue_index
-                current = await self.queue.selected_offset()
-                if current != plex_offset:
-                    await self.queue.set_selected_offset(plex_offset)
-                    self._sm6_publish_track_change(track)
+            await self._sm6_sync_plex_queue_offset(queue_index)
+            self._sm6_publish_track_change(self.current_track_info)
             return False
 
         self.current_track_info = track
@@ -2162,8 +2159,54 @@ class PlexDlnaAdapter(object):
             track_id,
             queue_index,
         )
-        self._sm6_publish_track_change(track)
+        await self._sm6_sync_plex_queue_offset(queue_index)
+        await self._sm6_on_sm6_track_advanced()
+        self._sm6_publish_track_change(self.current_track_info)
         return True
+
+    async def _sm6_bind_current_track_to_queue(self):
+        """Use the queue mirror track so timeline carries a valid playQueueItemID."""
+        if self.queue is None:
+            return self.current_track_info
+        try:
+            queue_track = await self.queue.selected_track()
+        except Exception as exc:
+            logger.debug("%s SM6 queue selected_track failed: %s", self.dlna.name, exc)
+            return self.current_track_info
+        self.current_track_info = queue_track
+        return queue_track
+
+    async def _sm6_on_sm6_track_advanced(self) -> None:
+        """Reset position after SM6 auto-next; timeline notify follows via publish."""
+        self.state.disarm_elapsed_assume()
+        self.state.elapsed = 0
+        if hasattr(self.state, "_sync_elapsed_anchor"):
+            self.state._sync_elapsed_anchor(0)
+
+    async def _sm6_sync_timeline_for_poll(self) -> None:
+        """Refresh queue selection before long-poll clients (e.g. Plexamp) read timeline."""
+        if not self._is_sm6_renderer() or self.queue is None:
+            return
+        if self.state.state not in _ACTIVE_TRANSPORT_STATES:
+            return
+        now = time.monotonic()
+        last = getattr(self, "_sm6_timeline_sync_at", 0.0)
+        if now - last < 3.0:
+            return
+        self._sm6_timeline_sync_at = now
+        await self._sm6_maybe_sync_playlist(force=True)
+
+    async def _sm6_sync_plex_queue_offset(self, queue_index: int) -> bool:
+        """Move Plex playQueue selection to match SM6 MediaQueueIndex."""
+        if queue_index < 0 or self.queue is None:
+            return False
+        plex_offset = self._sm6_queue_base_offset + queue_index
+        current = await self.queue.selected_offset()
+        changed = current != plex_offset
+        if changed:
+            await self.queue.set_selected_offset(plex_offset)
+        await self._sm6_bind_current_track_to_queue()
+        return changed
 
     def _sm6_playlist_fingerprint(self, playlist_state) -> tuple | None:
         if playlist_state is None or playlist_state.length <= 0:
@@ -2536,15 +2579,11 @@ class PlexDlnaAdapter(object):
                     return
             if await self._sm6_rebuild_plex_playlist_from_sm6(force=force):
                 return
-        if not force and self._sm6_passive_sync_blocked():
-            return
         try:
             from dlna.sm6_control import Sm6Control
 
             sm6 = Sm6Control(self.dlna.location_url)
             current_id, queue_index = await sm6.get_current_queue_position()
-            if not force and self._sm6_passive_sync_blocked():
-                return
             if not force and current_id == self._sm6_last_queue_track_id:
                 if self.queue is not None:
                     plex_offset = await self.queue.selected_offset()
@@ -4309,7 +4348,10 @@ class PlexDlnaAdapter(object):
         d = await self.get_state()
         if (not d or d.get("state") is None) and self.plex_state == "stopped":
             d = {"state": "stopped"}
-        keys = ['state', 'ratingKey', 'key', 'time', 'duration', 'playQueueItemID', 'shuffle', 'repeat', 'containerKey']
+        keys = [
+            'state', 'ratingKey', 'key', 'time', 'duration', 'playQueueItemID',
+            'playQueueID', 'playQueueVersion', 'shuffle', 'repeat', 'containerKey',
+        ]
         not_wanted_keys = []
         for k, _ in d.items():
             if k not in keys:
