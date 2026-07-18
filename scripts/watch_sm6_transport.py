@@ -6,10 +6,10 @@ Standalone — no SonoPlay app import (avoids dlna/plex circular import).
 Use the **native** SM6 description.xml URL (not Plex :8050 proxy).
 
 Example:
-  $env:SM6_TEST_DESCRIPTION_URL = "http://192.168.50.42/description.xml"
+  $env:SM6_TEST_DESCRIPTION_URL = "http://<sm6-host>/description.xml"
   python scripts/watch_sm6_transport.py
 
-  python scripts/watch_sm6_transport.py --description-url http://192.168.50.42/description.xml --interval 0.25
+  python scripts/watch_sm6_transport.py --description-url http://<sm6-host>/description.xml --interval 0.25
 """
 from __future__ import annotations
 
