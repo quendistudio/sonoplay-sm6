@@ -17,6 +17,7 @@ _spec.loader.exec_module(sm6_queue_plan)
 
 is_full_album_run = sm6_queue_plan.is_full_album_run
 plan_queue_segments = sm6_queue_plan.plan_queue_segments
+detect_sm6_play_mode_from_tracks = sm6_queue_plan.detect_sm6_play_mode_from_tracks
 
 
 def _track(parent_key: str, parent_index: int, title: str = "t") -> SimpleNamespace:
@@ -63,3 +64,17 @@ def test_plan_mixed_partial_then_full_album() -> None:
     tracks = [_track("a1", 3), _track("a1", 4)] + [_track("a2", i) for i in range(1, 3)]
     segments = plan_queue_segments(tracks, {"a1": 10, "a2": 2})
     assert [segment.kind for segment in segments] == ["track", "track", "album"]
+
+
+def test_detect_play_mode_album_after_full_pagination() -> None:
+    tracks = [_track("album1", i) for i in range(1, 5)]
+    assert detect_sm6_play_mode_from_tracks(tracks) == "album"
+
+
+def test_detect_play_mode_track_when_only_one_loaded() -> None:
+    assert detect_sm6_play_mode_from_tracks([_track("album1", 1)]) == "track"
+
+
+def test_detect_play_mode_playlist_for_multi_album() -> None:
+    tracks = [_track("a1", 1), _track("a2", 1)]
+    assert detect_sm6_play_mode_from_tracks(tracks) == "playlist"

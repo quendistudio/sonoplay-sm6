@@ -19,9 +19,9 @@ def test_stream_magic_6_by_manufacturer_and_model_name():
     assert needs_plex_dlna_stream_url(device)
 
 
-def test_friendly_name_alone_is_not_enough():
+def test_friendly_name_stream_magic_is_matched():
     device = _Device(name="Stream Magic 6", manufacturer="", model_name="")
-    assert not needs_plex_dlna_stream_url(device)
+    assert needs_plex_dlna_stream_url(device)
 
 
 def test_modern_cambridge_cxn_not_matched():

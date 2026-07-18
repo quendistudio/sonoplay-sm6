@@ -33,6 +33,44 @@ def sm6_action_for_enqueue(enqueue: str) -> str:
     return action
 
 
+def initial_sm6_queue_action(
+    *,
+    segment_kind: str,
+    replace_transcode_queue: bool = False,
+) -> str:
+    """First QueueFolder action: album container or hi-res transcode playlist clears SM6 queue."""
+    if segment_kind == "album" or replace_transcode_queue:
+        return sm6_action_for_enqueue("replace")
+    return sm6_action_for_enqueue("play")
+
+
+def plan_refresh_enqueue_actions(
+    new_indices: list[int],
+    *,
+    selected_after: int,
+) -> list[str]:
+    """Map refreshPlayQueue insertions to SM6 enqueue modes (add=APPEND, next=PLAY_NEXT).
+
+    - Add to queue: new items not contiguous at selected+1 → all APPEND.
+    - Play next (1 track): PLAY_NEXT.
+    - Play next (N contiguous tracks): PLAY_NEXT each in reverse order so SM6 order is preserved.
+    """
+    if not new_indices:
+        return []
+    indices = sorted(new_indices)
+    play_next_start = selected_after + 1
+    is_play_next_block = (
+        indices[0] == play_next_start
+        and indices == list(range(indices[0], indices[0] + len(indices)))
+    )
+    if not is_play_next_block:
+        return ["add"] * len(indices)
+    if len(indices) == 1:
+        return ["next"]
+    # ponytail: each PLAY_NEXT inserts after current — reverse to keep Plex order
+    return ["next"] * len(indices)
+
+
 def reciva_radio_invoke_url(description_url: str) -> str:
     base = description_url.rsplit("/", 1)[0]
     return f"{base}/RecivaRadio/invoke"

@@ -32,18 +32,18 @@ parse_playlist_track_details = sm6_playlist.parse_playlist_track_details
 sm6_set_current_playlist_track_id = sm6_playlist.sm6_set_current_playlist_track_id
 Sm6PlaylistEntry = sm6_playlist.Sm6PlaylistEntry
 
-# Extrait de plexupnp/.temp/playlist.txt (GetPlaylistTrackDetails)
+# Synthetic SOAP fixture (structure only — fictional track metadata)
 PLAYLIST_TRACK_DETAILS_RESPONSE = """<?xml version="1.0" ?>
-<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><r:GetPlaylistTrackDetailsResponse xmlns:r="urn:UuVol-com:service:UuVolControl:5"><TracksXML>&lt;reciva&gt;&lt;playlist start="0" count="16" total="12"&gt;&lt;playlist-entry id="0"&gt;&lt;artist&gt;Angèle&lt;/artist&gt;
-&lt;album&gt;Brol&lt;/album&gt;
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><r:GetPlaylistTrackDetailsResponse xmlns:r="urn:UuVol-com:service:UuVolControl:5"><TracksXML>&lt;reciva&gt;&lt;playlist start="0" count="16" total="12"&gt;&lt;playlist-entry id="0"&gt;&lt;artist&gt;Example Artist&lt;/artist&gt;
+&lt;album&gt;Example Album&lt;/album&gt;
 &lt;genre&gt;Unknown&lt;/genre&gt;
 &lt;duration&gt;202&lt;/duration&gt;
-&lt;title&gt;La Thune&lt;/title&gt;
+&lt;title&gt;Example Track A&lt;/title&gt;
 &lt;/playlist-entry&gt;
-&lt;playlist-entry id="1"&gt;&lt;artist&gt;Angèle&lt;/artist&gt;
-&lt;album&gt;Brol&lt;/album&gt;
+&lt;playlist-entry id="1"&gt;&lt;artist&gt;Example Artist&lt;/artist&gt;
+&lt;album&gt;Example Album&lt;/album&gt;
 &lt;duration&gt;189&lt;/duration&gt;
-&lt;title&gt;Balance ton quoi&lt;/title&gt;
+&lt;title&gt;example track b&lt;/title&gt;
 &lt;/playlist-entry&gt;
 &lt;/playlist&gt;&lt;/reciva&gt;</TracksXML></r:GetPlaylistTrackDetailsResponse></s:Body></s:Envelope>"""
 
@@ -56,12 +56,12 @@ def test_parse_playlist_track_details():
     entries = parse_playlist_track_details(PLAYLIST_TRACK_DETAILS_RESPONSE)
     assert len(entries) == 2
     assert entries[0].track_id == 0
-    assert entries[0].title == "La Thune"
-    assert entries[0].artist == "Angèle"
-    assert entries[0].album == "Brol"
+    assert entries[0].title == "Example Track A"
+    assert entries[0].artist == "Example Artist"
+    assert entries[0].album == "Example Album"
     assert entries[0].duration_seconds == 202
     assert entries[1].track_id == 1
-    assert entries[1].title == "Balance ton quoi"
+    assert entries[1].title == "example track b"
     assert entries[1].duration_seconds == 189
 
 

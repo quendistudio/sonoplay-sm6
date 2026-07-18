@@ -40,6 +40,20 @@ def is_full_album_run(run: list[Any], album_track_count: int) -> bool:
     return indices == list(range(1, album_track_count + 1))
 
 
+def detect_sm6_play_mode_from_tracks(tracks: list[Any]) -> str:
+    """Classify Plex playQueue intent after the full queue has been paginated."""
+    if len(tracks) <= 1:
+        return "track"
+    parents = {
+        str(getattr(track, "parentRatingKey", ""))
+        for track in tracks
+        if getattr(track, "parentRatingKey", None)
+    }
+    if len(parents) == 1 and next(iter(parents)):
+        return "album"
+    return "playlist"
+
+
 def plan_queue_segments(
     tracks: list[Any],
     album_track_counts: dict[str, int],

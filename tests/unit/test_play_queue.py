@@ -2,11 +2,12 @@
 
 import importlib
 import sys
-
-import pytest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
+from tests.conftest import ensure_real_plex_package, ensure_real_settings, reload_module
 from tests.fixtures.plex_tracks import (
     EXAMPLE_SAMPLE_RATE_HZ,
     EXAMPLE_THRESHOLD_KBPS,
@@ -20,8 +21,8 @@ def _load_play_queue_class():
     """Other unit tests stub plex.play_queue; reload the real module when needed."""
     mod = sys.modules.get("plex.play_queue")
     if mod is None or isinstance(getattr(mod, "PlayQueue", None), MagicMock):
-        sys.modules.pop("plex.play_queue", None)
-        mod = importlib.import_module("plex.play_queue")
+        ensure_real_plex_package()
+        mod = reload_module("plex.play_queue")
     return mod.PlayQueue
 
 
@@ -54,20 +55,18 @@ def play_queue():
 
 @pytest.fixture
 def transcode_thresholds(monkeypatch):
-    import settings as settings_pkg
+    settings_pkg = ensure_real_settings()
+    from settings import Settings
 
-    if isinstance(settings_pkg.settings, MagicMock):
-        from settings import Settings
-
-        monkeypatch.setattr(settings_pkg, "settings", Settings())
-
+    real_settings = Settings()
+    monkeypatch.setattr(settings_pkg, "settings", real_settings)
     monkeypatch.setattr(
-        settings_pkg.settings, "audio_transcode_threshold_kbps", EXAMPLE_THRESHOLD_KBPS
+        real_settings, "audio_transcode_threshold_kbps", EXAMPLE_THRESHOLD_KBPS
     )
     monkeypatch.setattr(
-        settings_pkg.settings, "audio_transcode_max_sample_rate_hz", EXAMPLE_SAMPLE_RATE_HZ
+        real_settings, "audio_transcode_max_sample_rate_hz", EXAMPLE_SAMPLE_RATE_HZ
     )
-    return settings_pkg.settings
+    return real_settings
 
 
 class TestIsTrackPlayable:
@@ -152,7 +151,7 @@ class TestBuildTranscodeUrl:
         url = play_queue.build_transcode_url(hi_res_flac_track())
         assert "/music/:/transcode/universal/start.m3u8" in url
         assert "protocol=hls" in url
-        assert "maxAudioBitrate=256" in url
+        assert "maxAudioBitrate=320" in url
         assert "mediaBufferSize=12288" in url
         assert "directStream=0" in url
         assert "directStreamAudio=1" in url
@@ -169,15 +168,25 @@ class TestBuildTranscodeUrl:
         assert f"path=%2Flibrary%2Fmetadata%2F{FAKE_TRACK_KEY_A}" in url
 
     def test_sm6_proxy_url_points_at_sonoplay(self, play_queue, transcode_thresholds, monkeypatch):
-        from settings import settings
+        from settings import Settings
         from tests.fixtures.network import FAKE_HOST_IP
 
-        monkeypatch.setattr(settings, "host_ip", FAKE_HOST_IP, raising=False)
-        monkeypatch.setattr(settings, "http_port", 32488, raising=False)
-        url = play_queue.build_sm6_transcode_proxy_url(hi_res_flac_track())
-        assert url == (
-            f"http://{FAKE_HOST_IP}:32488/player/stream/transcode.mp3"
-            f"?ratingKey={FAKE_TRACK_KEY_A}"
+        monkeypatch.setattr(transcode_thresholds, "host_ip", FAKE_HOST_IP, raising=False)
+        monkeypatch.setattr(transcode_thresholds, "http_port", 32488, raising=False)
+        monkeypatch.setattr("plex.transcode_stream.settings", transcode_thresholds)
+        monkeypatch.setattr("plex.transcode_auth.settings", transcode_thresholds)
+        monkeypatch.setattr(
+            Settings,
+            "get_token_for_uuid",
+            lambda self, uuid: "test-token" if uuid == "dev-1" else None,
         )
+        url = play_queue.build_sm6_transcode_proxy_url(
+            hi_res_flac_track(), device_uuid="dev-1"
+        )
+        assert url.startswith(
+            f"http://{FAKE_HOST_IP}:32488/player/stream/transcode.mp3?"
+        )
+        assert f"ratingKey={FAKE_TRACK_KEY_A}" in url
+        assert "device=dev-1" in url
         assert "32400" not in url
         assert "start.m3u8" not in url

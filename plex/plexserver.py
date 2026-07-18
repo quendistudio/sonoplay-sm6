@@ -749,10 +749,28 @@ async def dlna_subscribe(request: Request, uuid: str):
     return ""
 
 
+async def _notify_sm6_transcode_ready(device_uuid: str, rating_key: str) -> None:
+    try:
+        from dlna.dlna_device import get_device_by_uuid
+        from plex.adapters import adapter_by_device
+
+        device = await get_device_by_uuid(device_uuid)
+        if device is None:
+            return
+        adapter = await adapter_by_device(device)
+        if adapter is not None and hasattr(adapter, "_sm6_on_transcode_ready"):
+            await adapter._sm6_on_transcode_ready(rating_key)
+    except Exception as exc:
+        logger.debug("SM6 transcode ready notify failed: %s", exc)
+
+
 @s.get("/player/stream/transcode.mp3")
 async def stream_transcode_mp3(
     request: Request,
     ratingKey: str = Query(..., min_length=1),
+    device: str = Query(..., min_length=1),
+    exp: int = Query(...),
+    sig: str = Query(..., min_length=8),
 ):
     """
     Complete CBR MP3 for SM6: one ffmpeg job per track, shared by parallel GETs.
@@ -760,37 +778,58 @@ async def stream_transcode_mp3(
     from fastapi.responses import FileResponse
 
     from plex.mp3_transcode_cache import ensure_transcoded_mp3, ffmpeg_path
-    from plex.transcode_stream import resolve_pms_source_url_for_rating_key
+    from plex.transcode_stream import resolve_pms_source_for_rating_key
+
+    from plex.transcode_auth import verify_signed_transcode_request
 
     await guess_host_ip(request)
     key = ratingKey.strip()
     if not key.isdigit():
         raise HTTPException(status_code=400, detail="invalid ratingKey")
+    if not verify_signed_transcode_request(key, device.strip(), int(exp), sig):
+        raise HTTPException(status_code=403, detail="invalid transcode signature")
 
     if not ffmpeg_path():
         raise HTTPException(status_code=503, detail="ffmpeg not available")
 
     cbr_kbps = settings.audio_transcode_proxy_kbps
-    source_url = await resolve_pms_source_url_for_rating_key(key)
-    if not source_url:
+    source = await resolve_pms_source_for_rating_key(key, device_uuid=device.strip())
+    if not source:
         raise HTTPException(status_code=503, detail="Plex source unavailable")
+    source_url, plex_token = source
 
-    logger.info(
-        "SM6 transcode proxy encode ratingKey=%s cbr=%s kbps source=%s",
-        key,
-        cbr_kbps,
-        source_url.split("?", 1)[0],
-    )
+    from plex.mp3_transcode_cache import cache_file_valid, cache_path_for
+
+    cache_path = cache_path_for(key, cbr_kbps=cbr_kbps)
+    cache_hit = cache_file_valid(cache_path)
 
     try:
         mp3_path = await ensure_transcoded_mp3(
             key,
             source_url=source_url,
             cbr_kbps=cbr_kbps,
+            plex_token=plex_token,
         )
     except RuntimeError as exc:
         logger.warning("SM6 transcode proxy failed ratingKey=%s: %s", key, exc)
         raise HTTPException(status_code=503, detail="transcode failed") from exc
+
+    if cache_hit:
+        logger.info(
+            "SM6 transcode proxy cache hit ratingKey=%s cbr=%s kbps device=%s",
+            key,
+            cbr_kbps,
+            device,
+        )
+    else:
+        logger.info(
+            "SM6 transcode proxy encode ratingKey=%s cbr=%s kbps source=%s device=%s",
+            key,
+            cbr_kbps,
+            source_url.split("?", 1)[0],
+            device,
+        )
+    await _notify_sm6_transcode_ready(device.strip(), key)
 
     size = mp3_path.stat().st_size
     return FileResponse(

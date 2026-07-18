@@ -26,6 +26,7 @@ build_is_registered_navigator_name_body = module.build_is_registered_navigator_n
 build_register_named_navigator_body = module.build_register_named_navigator_body
 parse_is_registered_navigator_name = module.parse_is_registered_navigator_name
 parse_ret_navigator_id = module.parse_ret_navigator_id
+parse_queue_folder_result = module.parse_queue_folder_result
 
 
 def test_parse_is_registered_navigator_name_registered() -> None:
@@ -62,3 +63,8 @@ def test_build_register_named_navigator_includes_name() -> None:
     body = build_register_named_navigator_body("My Plex Server")
     assert "My Plex Server" in body
     assert "RegisterNamedNavigator" in body
+
+
+def test_parse_queue_folder_result_ok_and_missing() -> None:
+    assert parse_queue_folder_result("<Result>OK</Result>") == "OK"
+    assert parse_queue_folder_result("<s:Body></s:Body>") is None

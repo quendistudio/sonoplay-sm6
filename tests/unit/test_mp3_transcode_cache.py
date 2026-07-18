@@ -24,24 +24,43 @@ def test_ffmpeg_mp3_file_args(tmp_path):
 
 
 def test_build_sm6_transcode_proxy_url(monkeypatch):
-    from settings import settings
     from tests.fixtures.network import FAKE_HOST_IP
     from tests.fixtures.plex_tracks import FAKE_TRACK_KEY_A
 
-    monkeypatch.setattr(settings, "host_ip", FAKE_HOST_IP, raising=False)
-    monkeypatch.setattr(settings, "http_port", 32488, raising=False)
-    url = build_sm6_transcode_proxy_url(FAKE_TRACK_KEY_A)
-    assert url == (
-        f"http://{FAKE_HOST_IP}:32488/player/stream/transcode.mp3"
-        f"?ratingKey={FAKE_TRACK_KEY_A}"
+    monkeypatch.setattr(
+        "plex.transcode_stream.settings.host_ip",
+        FAKE_HOST_IP,
+        raising=False,
     )
+    monkeypatch.setattr(
+        "plex.transcode_stream.settings.http_port",
+        32488,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "plex.transcode_stream.settings.get_token_for_uuid",
+        lambda uuid: "test-token" if uuid == "dev-1" else None,
+    )
+    url = build_sm6_transcode_proxy_url(FAKE_TRACK_KEY_A, "dev-1")
+    assert url.startswith(
+        f"http://{FAKE_HOST_IP}:32488/player/stream/transcode.mp3?"
+    )
+    assert "ratingKey=900001" in url
+    assert "device=dev-1" in url
+    assert "sig=" in url
 
 
 @pytest.mark.asyncio
 async def test_concurrent_gets_share_one_encode(monkeypatch, tmp_path):
     calls = {"n": 0}
 
-    async def fake_ffmpeg(source_url: str, output_path: Path, *, cbr_kbps: int) -> None:
+    async def fake_ffmpeg(
+        source_url: str,
+        output_path: Path,
+        *,
+        cbr_kbps: int,
+        plex_token: str | None = None,
+    ) -> None:
         calls["n"] += 1
         await asyncio.sleep(0.05)
         output_path.write_bytes(b"\xff\xfb" + b"\x00" * 128)

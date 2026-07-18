@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,26 +15,39 @@ def ffmpeg_path() -> str | None:
     return shutil.which("ffmpeg")
 
 
-def ffmpeg_mp3_file_args(source_url: str, output_path: Path, *, cbr_kbps: int) -> list[str]:
-    """FLAC (or other) HTTP/file input → complete CBR MP3 on disk."""
+def ffmpeg_mp3_file_args(
+    source_url: str,
+    output_path: Path,
+    *,
+    cbr_kbps: int,
+    plex_token: str | None = None,
+) -> list[str]:
+    """FLAC (or other) HTTP input → complete CBR MP3 on disk."""
     if cbr_kbps <= 0:
         raise ValueError("cbr_kbps must be positive")
     bitrate = f"{int(cbr_kbps)}k"
-    return [
+    args = [
         "-loglevel",
         "error",
         "-y",
-        "-i",
-        source_url,
-        "-vn",
-        "-c:a",
-        "libmp3lame",
-        "-b:a",
-        bitrate,
-        "-write_xing",
-        "1",
-        str(output_path),
     ]
+    if plex_token:
+        args.extend(["-headers", f"X-Plex-Token: {plex_token}\r\n"])
+    args.extend(
+        [
+            "-i",
+            source_url,
+            "-vn",
+            "-c:a",
+            "libmp3lame",
+            "-b:a",
+            bitrate,
+            "-write_xing",
+            "1",
+            str(output_path),
+        ]
+    )
+    return args
 
 
 def cache_dir() -> Path:
@@ -46,6 +60,20 @@ def cache_dir() -> Path:
 
 def cache_path_for(rating_key: str, *, cbr_kbps: int) -> Path:
     return cache_dir() / f"{rating_key}-{cbr_kbps}.mp3"
+
+
+def transcode_cache_ttl_seconds() -> float:
+    from settings import settings
+
+    hours = getattr(settings, "transcode_cache_ttl_hours", 96)
+    return max(1.0, float(hours) * 3600.0)
+
+
+def cache_file_valid(path: Path) -> bool:
+    if not path.is_file() or path.stat().st_size <= 0:
+        return False
+    age = time.time() - path.stat().st_mtime
+    return age <= transcode_cache_ttl_seconds()
 
 
 @dataclass
@@ -64,7 +92,13 @@ def _job_key(rating_key: str, cbr_kbps: int) -> str:
     return f"{rating_key}:{cbr_kbps}"
 
 
-async def _run_ffmpeg(source_url: str, output_path: Path, *, cbr_kbps: int) -> None:
+async def _run_ffmpeg(
+    source_url: str,
+    output_path: Path,
+    *,
+    cbr_kbps: int,
+    plex_token: str | None = None,
+) -> None:
     ffmpeg = ffmpeg_path()
     if not ffmpeg:
         raise RuntimeError("ffmpeg not found on PATH")
@@ -76,7 +110,12 @@ async def _run_ffmpeg(source_url: str, output_path: Path, *, cbr_kbps: int) -> N
 
     proc = await asyncio.create_subprocess_exec(
         ffmpeg,
-        *ffmpeg_mp3_file_args(source_url, tmp_path, cbr_kbps=cbr_kbps),
+        *ffmpeg_mp3_file_args(
+            source_url,
+            tmp_path,
+            cbr_kbps=cbr_kbps,
+            plex_token=plex_token,
+        ),
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -100,6 +139,7 @@ async def ensure_transcoded_mp3(
     *,
     source_url: str,
     cbr_kbps: int,
+    plex_token: str | None = None,
 ) -> Path:
     """
     Return path to a complete MP3 file for ``rating_key``.
@@ -110,18 +150,25 @@ async def ensure_transcoded_mp3(
     output_path = cache_path_for(rating_key, cbr_kbps=cbr_kbps)
 
     async with _registry_lock:
-        if output_path.is_file() and output_path.stat().st_size > 0:
+        if cache_file_valid(output_path):
             return output_path
+        if output_path.is_file():
+            output_path.unlink(missing_ok=True)
 
         job = _registry.get(key)
         if job is None or job.task is None or job.task.done():
-            if job and job.task and job.task.done() and job.path and job.path.is_file():
+            if job and job.task and job.task.done() and job.path and cache_file_valid(job.path):
                 return job.path
             job = _EncodeJob(path=output_path)
 
             async def _worker() -> None:
                 try:
-                    await _run_ffmpeg(source_url, output_path, cbr_kbps=cbr_kbps)
+                    await _run_ffmpeg(
+                        source_url,
+                        output_path,
+                        cbr_kbps=cbr_kbps,
+                        plex_token=plex_token,
+                    )
                     job.path = output_path
                     logger.info(
                         "transcode cache ready ratingKey=%s cbr=%s kbps bytes=%s",
@@ -150,14 +197,14 @@ async def ensure_transcoded_mp3(
             job = _registry.get(key)
             if job:
                 job.waiters = max(0, job.waiters - 1)
+                if job.waiters == 0 and job.task and job.task.done():
+                    del _registry[key]
 
     async with _registry_lock:
         job = _registry.get(key)
         if job and job.error:
             raise job.error
-        if job and job.path and job.path.is_file():
-            return job.path
-        if output_path.is_file() and output_path.stat().st_size > 0:
+        if cache_file_valid(output_path):
             return output_path
 
     raise RuntimeError("transcode finished without output file")

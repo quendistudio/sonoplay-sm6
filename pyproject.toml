@@ -48,6 +48,7 @@ Issues = "https://github.com/aquantumofdonuts/sonoplay/issues"
 testpaths = ["tests"]
 asyncio_mode = "auto"
 pythonpath = ["."]
+addopts = "--import-mode=importlib"
 
 [tool.ruff]
 line-length = 120

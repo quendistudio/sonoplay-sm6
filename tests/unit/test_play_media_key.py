@@ -63,6 +63,7 @@ def play_media_adapter():
     adapter = object.__new__(PlexDlnaAdapter)
     adapter.dlna = MagicMock()
     adapter.dlna.name = "SM6"
+    adapter.dlna.get_data = AsyncMock()
 
     adapter.state = MagicMock()
     adapter.state.touch_access_time = MagicMock()
@@ -79,6 +80,7 @@ def play_media_adapter():
     adapter.queue = queue
 
     adapter.play_selected_queue_item = AsyncMock()
+    adapter._is_sm6_renderer = lambda: False
     return adapter
 
 

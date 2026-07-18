@@ -18,6 +18,7 @@ SKIP_DIRS = {
     ".temp",
     "config",
     "data",
+    "tests/fixtures/private",
 }
 
 SKIP_FILES = {
@@ -52,6 +53,7 @@ PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ),
     ("Plex token in URL", re.compile(r"X-Plex-Token=[A-Za-z0-9_-]{10,}")),
     ("Plex token assignment", re.compile(r"PLEX_PMS_TOKEN\s*=\s*[A-Za-z0-9_-]{10,}")),
+    ("capture from local .temp", re.compile(r"plexupnp/\.temp|/\.temp/[a-z]+\.txt", re.I)),
 ]
 
 # Allowlisted substrings (placeholders, docs, standard ports).
@@ -84,6 +86,21 @@ def iter_files() -> list[Path]:
     return sorted(files)
 
 
+def _match_allowed(text: str, match: re.Match[str]) -> bool:
+    """True when the pattern match lies entirely inside an allowlisted substring."""
+    start, end = match.span()
+    for token in ALLOW_SUBSTRINGS:
+        pos = 0
+        while True:
+            idx = text.find(token, pos)
+            if idx == -1:
+                break
+            if idx <= start and end <= idx + len(token):
+                return True
+            pos = idx + 1
+    return False
+
+
 def scan_file(path: Path) -> list[str]:
     rel = path.relative_to(ROOT).as_posix()
     try:
@@ -93,14 +110,15 @@ def scan_file(path: Path) -> list[str]:
 
     issues: list[str] = []
     for line_no, line in enumerate(text.splitlines(), start=1):
-        if any(token in line for token in ALLOW_SUBSTRINGS):
-            continue
         for label, pattern in PATTERNS:
-            if pattern.search(line):
+            for match in pattern.finditer(line):
+                if _match_allowed(line, match):
+                    continue
                 snippet = line.strip()
                 if len(snippet) > 120:
                     snippet = snippet[:117] + "..."
                 issues.append(f"{rel}:{line_no}: {label} -> {snippet}")
+                break
     return issues
 
 

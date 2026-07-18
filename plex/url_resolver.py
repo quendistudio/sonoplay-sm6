@@ -7,7 +7,7 @@ import logging
 import xml.sax.saxutils
 from pathlib import Path
 
-from settings import settings
+from settings import atomic_write_json, settings
 
 from .dlna_browser import (
     DlnaBrowser,
@@ -18,6 +18,11 @@ from .dlna_browser import (
     find_track_in_album,
     load_dlna_discovery_cache,
     save_dlna_discovery_cache,
+)
+from .dlna_stream_cache import (
+    StreamCacheEntry,
+    object_id_from_stream_url,
+    rating_key_from_uri,
 )
 
 logger = logging.getLogger(__name__)
@@ -59,10 +64,10 @@ def _estimated_mp3_size_bytes(duration_ms: int | None, cbr_kbps: int) -> int | N
 
 
 def _mp3_size_for_track(rating_key: str, duration_ms: int | None, cbr_kbps: int) -> int | None:
-    from plex.mp3_transcode_cache import cache_path_for
+    from plex.mp3_transcode_cache import cache_file_valid, cache_path_for
 
     cached = cache_path_for(rating_key, cbr_kbps=cbr_kbps)
-    if cached.is_file() and cached.stat().st_size > 0:
+    if cache_file_valid(cached):
         return cached.stat().st_size
     return _estimated_mp3_size_bytes(duration_ms, cbr_kbps)
 
@@ -124,15 +129,26 @@ class UrlResolver:
         self._musique_id: str | None = settings.plex_dlna_musique_id
         self._music_folder_id: str | None = settings.plex_dlna_music_folder_id
         self._cache_path = cache_path
-        self._cache: dict[str, str] = {}
+        self._cache: dict[str, StreamCacheEntry] = {}
+        self._object_to_rating: dict[str, str] = {}
         self._didl_cache: dict[str, str] = {}
         self._ids_lock = asyncio.Lock()
+        self._cache_lock = asyncio.Lock()
         if cache_path and cache_path.exists():
             try:
                 raw = json.loads(cache_path.read_text(encoding="utf-8"))
                 if isinstance(raw, dict):
-                    self._cache = dict(raw.get("streams", raw))
-                    self._didl_cache = dict(raw.get("didl", {}))
+                    streams = raw.get("streams", raw)
+                    if isinstance(streams, dict):
+                        for key, value in streams.items():
+                            entry = StreamCacheEntry.from_raw(value)
+                            if entry:
+                                self._cache[str(key)] = entry
+                                if entry.object_id:
+                                    self._object_to_rating[entry.object_id] = str(key)
+                    didl = raw.get("didl")
+                    if isinstance(didl, dict):
+                        self._didl_cache = dict(didl)
             except (OSError, json.JSONDecodeError) as exc:
                 logger.warning("Could not load DLNA URL cache %s: %s", cache_path, exc)
 
@@ -168,35 +184,145 @@ class UrlResolver:
                 self._music_folder_id,
             )
 
+    async def _store_stream(self, track, item) -> str:
+        rating_key = str(getattr(track, "ratingKey", "") or "")
+        oid = object_id_from_stream_url(item.url)
+        entry = StreamCacheEntry.from_track(track, item.url, object_id=oid)
+        async with self._cache_lock:
+            self._cache[rating_key] = entry
+            if oid:
+                self._object_to_rating[oid] = rating_key
+            self._persist_cache_unlocked()
+        return item.url
+
+    async def _pick_album_track(self, track, album_title: str, artist: str | None):
+        title = getattr(track, "title", None)
+        if not title:
+            return None
+        album_items = await browse_album_tracks(
+            self._browser,
+            self._musique_id,
+            album_title,
+            artist=artist,
+        )
+        target = str(title).casefold()
+        matches = [i for i in album_items if i.title.casefold() == target and i.url]
+        parent_index = getattr(track, "parentIndex", None)
+        duration_ms = getattr(track, "duration", None)
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            picked = self._disambiguate_album_tracks(
+                track,
+                matches,
+                album_items,
+                parent_index=parent_index,
+                duration_ms=duration_ms,
+            )
+            if picked is not None:
+                return picked
+            logger.warning(
+                "DLNA ambiguous title %r in album %r (%d matches) — using first match",
+                title,
+                album_title,
+                len(matches),
+            )
+            return matches[0]
+        if parent_index is not None:
+            try:
+                idx = int(parent_index) - 1
+                if 0 <= idx < len(album_items) and album_items[idx].url:
+                    return album_items[idx]
+            except (TypeError, ValueError):
+                pass
+        return None
+
+    def _disambiguate_album_tracks(
+        self,
+        track,
+        title_matches: list,
+        album_items: list,
+        *,
+        parent_index,
+        duration_ms,
+    ):
+        """Prefer parentIndex, then composite artist/album/title alignment."""
+        if parent_index is not None:
+            try:
+                idx = int(parent_index) - 1
+                if 0 <= idx < len(album_items):
+                    candidate = album_items[idx]
+                    if candidate.url and candidate in title_matches:
+                        return candidate
+            except (TypeError, ValueError):
+                pass
+        artist = getattr(track, "grandparentTitle", None) or getattr(track, "parentTitle", None)
+        album = getattr(track, "parentTitle", None)
+        scored: list[tuple[int, object]] = []
+        for item in title_matches:
+            score = 0
+            if parent_index is not None:
+                try:
+                    idx = album_items.index(item)
+                    if idx == int(parent_index) - 1:
+                        score += 8
+                except ValueError:
+                    pass
+            if artist and str(artist).casefold() in item.title.casefold():
+                score += 1
+            if album and str(album).casefold() in item.title.casefold():
+                score += 1
+            scored.append((score, item))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        if not scored:
+            return None
+        best_score, best_item = scored[0]
+        if len(scored) > 1 and scored[1][0] == best_score:
+            logger.warning(
+                "DLNA disambiguation tie for %r (parentIndex=%s duration=%s) — using %s",
+                getattr(track, "title", "?"),
+                parent_index,
+                duration_ms,
+                getattr(best_item, "object_id", "?"),
+            )
+        return best_item if best_score > 0 or len(scored) == 1 else None
+
     async def resolve_stream_url(self, track) -> str:
         await self._ensure_dlna_ids()
         rating_key = str(getattr(track, "ratingKey", "") or "")
         if not rating_key:
             raise LookupError("Track without ratingKey")
-        if rating_key in self._cache:
-            url = self._cache[rating_key]
+        async with self._cache_lock:
+            cached = self._cache.get(rating_key)
+        if cached and cached.matches_track(track):
             logger.info(
                 "DLNA URL cache hit ratingKey=%s -> %s",
                 rating_key,
-                url,
+                cached.url,
             )
-            return url
+            return cached.url
+        if cached and not cached.matches_track(track):
+            logger.info(
+                "DLNA URL cache invalidated ratingKey=%s (metadata mismatch)",
+                rating_key,
+            )
+            async with self._cache_lock:
+                self._cache.pop(rating_key, None)
+                if cached.object_id:
+                    self._object_to_rating.pop(cached.object_id, None)
 
         title = getattr(track, "title", None)
         album_title = getattr(track, "parentTitle", None)
         artist = getattr(track, "grandparentTitle", None) or album_title
 
         if album_title and title:
-            for item in await browse_album_tracks(
-                self._browser,
-                self._musique_id,
+            item = await self._pick_album_track(
+                track,
                 str(album_title),
-                artist=str(artist) if artist else None,
-            ):
-                if item.title.casefold() == str(title).casefold() and item.url:
-                    self._cache[rating_key] = item.url
-                    self._persist_cache()
-                    return item.url
+                str(artist) if artist else None,
+            )
+            if item and item.url:
+                return await self._store_stream(track, item)
 
         if title and self._music_folder_id:
             music_root = None
@@ -214,11 +340,9 @@ class UrlResolver:
                     root_id=music_root.object_id,
                     max_depth=5,
                 )
-                item = matches.get(str(title))
+                item = matches.get(str(title).casefold())
                 if item and item.url:
-                    self._cache[rating_key] = item.url
-                    self._persist_cache()
-                    return item.url
+                    return await self._store_stream(track, item)
 
         raise LookupError(f"DLNA URL not found for ratingKey {rating_key} ({title})")
 
@@ -226,14 +350,20 @@ class UrlResolver:
         """Plex ratingKey from a Plex DLNA /object/… URL (cache or object id)."""
         if not url:
             return None
-        for rating_key, cached_url in self._cache.items():
-            if cached_url == url:
+        embedded = rating_key_from_uri(url)
+        if embedded:
+            return embedded
+        for rating_key, entry in self._cache.items():
+            if entry.url == url:
                 return rating_key
-        object_id = _object_id_from_stream_url(url)
+        object_id = object_id_from_stream_url(url)
         if not object_id:
             return None
-        for rating_key, cached_url in self._cache.items():
-            if object_id in cached_url:
+        mapped = self._object_to_rating.get(object_id)
+        if mapped:
+            return mapped
+        for rating_key, entry in self._cache.items():
+            if entry.object_id == object_id:
                 return rating_key
         return None
 
@@ -265,7 +395,7 @@ class UrlResolver:
             )
             didl = await self._browser.browse_object_didl(dlna_item.object_id)
             self._didl_cache[cache_key] = didl
-            self._persist_cache()
+            await self._persist_cache()
             logger.info(
                 "Resolved Plex DLNA album DIDL for %s (ratingKey=%s, object_id=%s)",
                 album_title,
@@ -303,7 +433,7 @@ class UrlResolver:
         )
         didl = await self._browser.browse_object_didl(dlna_item.object_id)
         self._didl_cache[cache_key] = didl
-        self._persist_cache()
+        await self._persist_cache()
         logger.info(
             "Resolved Plex DLNA DIDL for %s (ratingKey=%s, object_id=%s)",
             track_title,
@@ -351,24 +481,19 @@ class UrlResolver:
         didl = await self.resolve_didl(track, media_kind="track")
         return didl, 0
 
-    def _persist_cache(self) -> None:
+    def _persist_cache_unlocked(self) -> None:
         if not self._cache_path:
             return
         try:
-            self._cache_path.parent.mkdir(parents=True, exist_ok=True)
-            payload = {"streams": self._cache, "didl": self._didl_cache}
-            self._cache_path.write_text(
-                json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
-                encoding="utf-8",
-            )
+            streams = {key: entry.to_json() for key, entry in self._cache.items()}
+            payload = {"streams": streams, "didl": self._didl_cache}
+            atomic_write_json(self._cache_path, payload)
         except OSError as exc:
             logger.warning("Could not persist DLNA URL cache: %s", exc)
 
-
-def _object_id_from_stream_url(url: str | None) -> str | None:
-    if not url or "/object/" not in url:
-        return None
-    return url.split("/object/", 1)[1].split("/", 1)[0]
+    async def _persist_cache(self) -> None:
+        async with self._cache_lock:
+            self._persist_cache_unlocked()
 
 
 def get_url_resolver() -> UrlResolver:

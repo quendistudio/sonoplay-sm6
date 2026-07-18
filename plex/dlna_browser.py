@@ -368,8 +368,8 @@ async def find_items_by_title(
             return
         for item in await browser.browse(object_id):
             key = item.title.casefold()
-            if not item.is_container and item.url and key in wanted and item.title not in found:
-                found[item.title] = item
+            if not item.is_container and item.url and key in wanted and key not in found:
+                found[key] = item
             if item.is_container:
                 await walk(item.object_id, depth + 1)
 

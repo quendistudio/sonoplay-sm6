@@ -63,6 +63,14 @@ from dlna.sm6_playlist import (
     parse_playlist_length,
     parse_playlist_track_details,
 )
+from dlna.sm6_playlist_edit import (
+    DELETE_PLAYLIST_TRACK_ACTION,
+    INSERT_PLAYLIST_TRACK_ACTION,
+    MOVE_PLAYLIST_TRACK_ACTION,
+    build_delete_playlist_track_body,
+    build_insert_playlist_track_body,
+    build_move_playlist_track_body,
+)
 from dlna.sm6_power import (
     GET_POWER_STATE_ACTION,
     SET_POWER_STATE_ACTION,
@@ -253,6 +261,39 @@ class Sm6Control:
                 label="DeleteAll",
             )
 
+    async def insert_playlist_track(self, *, insert_position: int, didl: str) -> None:
+        async with self._lock:
+            logger.info("SM6 InsertPlaylistTrack position=%s", insert_position)
+            await self._post(
+                reciva_radio_invoke_url(self._description_url),
+                build_insert_playlist_track_body(
+                    insert_position=insert_position,
+                    didl=didl,
+                ),
+                INSERT_PLAYLIST_TRACK_ACTION,
+                label="InsertPlaylistTrack",
+            )
+
+    async def delete_playlist_track(self, *, playlist_track_id: int) -> None:
+        async with self._lock:
+            logger.info("SM6 DeletePlaylistTrack id=%s", playlist_track_id)
+            await self._post(
+                reciva_radio_invoke_url(self._description_url),
+                build_delete_playlist_track_body(playlist_track_id=playlist_track_id),
+                DELETE_PLAYLIST_TRACK_ACTION,
+                label="DeletePlaylistTrack",
+            )
+
+    async def move_playlist_track(self, *, from_index: int, to_index: int) -> None:
+        async with self._lock:
+            logger.info("SM6 MovePlaylistTrack from=%s to=%s", from_index, to_index)
+            await self._post(
+                reciva_radio_invoke_url(self._description_url),
+                build_move_playlist_track_body(from_index=from_index, to_index=to_index),
+                MOVE_PLAYLIST_TRACK_ACTION,
+                label="MovePlaylistTrack",
+            )
+
     async def queue_folder(
         self,
         didl: str,
@@ -288,8 +329,8 @@ class Sm6Control:
                 raise RuntimeError(
                     f"QueueFolder: Plex navigator id={resolved!r} not recognized by the SM6"
                 )
-            if result and result != "OK":
-                raise RuntimeError(f"QueueFolder: {result}")
+            if result != "OK":
+                raise RuntimeError(f"QueueFolder: {result or 'missing Result'}")
 
     async def key_pressed(self, key: str) -> None:
         async with self._lock:

@@ -110,8 +110,8 @@ class Settings(BaseSettings):
     audio_transcode_max_sample_rate_hz: int | None = 48000  # Max for Sonos/most DLNA
     # Target output bitrate when Plex transcodes (musicBitrate); not the trigger threshold.
     audio_transcode_target_kbps: int = 320
-    # SM6 proxy: constant MP3 bitrate (256, then 192 or 128 if buffering issues).
-    audio_transcode_proxy_kbps: int = 256
+    # SM6 proxy: constant MP3 bitrate (320, then 256, 192 or 128 if buffering issues).
+    audio_transcode_proxy_kbps: int = 320
     
     # HTTP timeout settings (in seconds)
     http_timeout_default: float = 10.0  # Default timeout for all requests
@@ -153,6 +153,7 @@ class Settings(BaseSettings):
     sm6_play_timeline_push_interval_seconds: float = 0.25
     sm6_plexamp_volume_step_enabled: bool = True
     sm6_plexamp_volume_step_max_delta: int = 8
+    transcode_cache_ttl_hours: int = 96
 
     def __init__(self, **values):
         super().__init__(**values)

@@ -454,14 +454,14 @@ class PlayQueue(object):
             raise ValueError("track ratingKey required for transcode URL")
         return self.build_plex_hls_transcode_url(str(rating_key))
 
-    def build_sm6_transcode_proxy_url(self, track) -> str:
+    def build_sm6_transcode_proxy_url(self, track, *, device_uuid: str) -> str:
         """SonoPlay MP3 stream URL for SM6 QueueFolder ``<res>``."""
         rating_key = self._plex_attr(track, "ratingKey")
         if not rating_key:
             raise ValueError("track ratingKey required for SM6 transcode proxy URL")
         from plex.transcode_stream import build_sm6_transcode_proxy_url
 
-        return build_sm6_transcode_proxy_url(str(rating_key))
+        return build_sm6_transcode_proxy_url(str(rating_key), device_uuid)
 
     async def url_for_track(self, track, force_transcode=False, dlna_device=None):
         """
