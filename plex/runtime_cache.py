@@ -105,3 +105,12 @@ def remember_music_library_key(key: str) -> None:
 def cached_music_library_key() -> str | None:
     key = load_runtime_cache().get("plex_music_library_key")
     return str(key) if key else None
+
+
+def remember_plex_dlna_server_udn(udn: str) -> None:
+    merge_runtime_cache(plex_dlna_server_udn=str(udn).strip())
+
+
+def cached_plex_dlna_server_udn() -> str | None:
+    udn = load_runtime_cache().get("plex_dlna_server_udn")
+    return str(udn).strip() if udn else None

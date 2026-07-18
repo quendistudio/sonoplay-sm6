@@ -341,6 +341,58 @@ async def plex_dlna_server_udn(device_url: str, *, timeout: float = 30.0) -> str
     raise RuntimeError("Plex DLNA UDN not found in DeviceDescription.xml")
 
 
+def machine_identifier_to_dlna_udn(machine_identifier: str) -> str:
+    """Derive Plex DLNA ServerUDN from PMS machineIdentifier (first 128 bits as UUID)."""
+    hex_id = str(machine_identifier or "").replace("-", "").lower()
+    if len(hex_id) < 32:
+        raise ValueError(f"machineIdentifier too short for DLNA UDN: {machine_identifier!r}")
+    prefix = hex_id[:32]
+    return (
+        f"{prefix[0:8]}-{prefix[8:12]}-{prefix[12:16]}"
+        f"-{prefix[16:20]}-{prefix[20:32]}"
+    )
+
+
+async def resolve_plex_dlna_server_udn(
+    device_url: str | None = None,
+    *,
+    machine_identifier: str | None = None,
+    timeout: float = 8.0,
+) -> str:
+    """Resolve Plex DLNA ServerUDN: cache → DeviceDescription → machineIdentifier."""
+    from plex.runtime_cache import (
+        cached_plex_dlna_server_udn,
+        cached_plex_session,
+        remember_plex_dlna_server_udn,
+    )
+
+    cached = cached_plex_dlna_server_udn()
+    if cached:
+        return cached
+
+    if device_url:
+        try:
+            udn = await plex_dlna_server_udn(device_url, timeout=timeout)
+            remember_plex_dlna_server_udn(udn)
+            return udn
+        except Exception as exc:
+            logger.warning(
+                "Plex DLNA DeviceDescription unreachable (%s); trying machineIdentifier UDN",
+                exc,
+            )
+
+    machine_id = machine_identifier or cached_plex_session().get("machine_id")
+    if machine_id:
+        udn = machine_identifier_to_dlna_udn(str(machine_id))
+        remember_plex_dlna_server_udn(udn)
+        logger.info("Plex DLNA ServerUDN derived from machineIdentifier: %s", udn)
+        return udn
+
+    raise RuntimeError(
+        "Plex DLNA ServerUDN unavailable (port 32469 unreachable and no machineIdentifier)",
+    )
+
+
 async def plex_dlna_friendly_name(device_url: str, *, timeout: float = 30.0) -> str | None:
     async with g.http.get(device_url, timeout=timeout) as response:
         response.raise_for_status()

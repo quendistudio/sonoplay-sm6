@@ -2332,6 +2332,19 @@ class PlexDlnaAdapter(object):
         except Exception as exc:
             logger.debug("%s PMS /identity failed: %s", self.dlna.name, exc)
 
+    async def _sm6_plex_server_udn(self) -> str:
+        from plex.dlna_browser import resolve_plex_dlna_server_udn
+        from settings import settings
+
+        machine_id = getattr(self.plex_lib, "machine_id", None) if self.plex_lib else None
+        if not machine_id:
+            await self._bootstrap_pms_machine_id()
+            machine_id = getattr(self.plex_lib, "machine_id", None) if self.plex_lib else None
+        return await resolve_plex_dlna_server_udn(
+            settings.resolved_plex_dlna_device_url(),
+            machine_identifier=machine_id,
+        )
+
     def _resolve_sm6_pms_token(self) -> str | None:
         """PMS token for SM6 playlist rebuild (client session, device link, or env)."""
         if self.plex_lib.token:
@@ -3295,7 +3308,6 @@ class PlexDlnaAdapter(object):
     ) -> None:
         from dlna.sm6_control import Sm6Control
         from dlna.sm6_queue import sm6_action_for_enqueue
-        from plex.dlna_browser import plex_dlna_server_udn
         from plex.url_resolver import get_url_resolver
         from settings import settings
 
@@ -3320,8 +3332,8 @@ class PlexDlnaAdapter(object):
                 f"Plex DLNA resolve timed out after {_DLNA_RESOLVE_TIMEOUT_SECONDS}s "
                 f"for ratingKey={rating_key}"
             ) from exc
-        server_udn = await plex_dlna_server_udn(settings.resolved_plex_dlna_device_url())
 
+        server_udn = await self._sm6_plex_server_udn()
         sm6 = Sm6Control(self.dlna.location_url)
         action = sm6_action_for_enqueue("play")
         logger.info(
@@ -3384,7 +3396,6 @@ class PlexDlnaAdapter(object):
     ) -> None:
         from dlna.sm6_control import Sm6Control
         from dlna.sm6_queue import sm6_action_for_enqueue
-        from plex.dlna_browser import plex_dlna_server_udn
         from plex.url_resolver import get_url_resolver
         from settings import settings
 
@@ -3452,8 +3463,8 @@ class PlexDlnaAdapter(object):
             len(album_tracks),
         )
         didl = await resolver.resolve_didl(album, media_kind="album")
-        server_udn = await plex_dlna_server_udn(settings.resolved_plex_dlna_device_url())
 
+        server_udn = await self._sm6_plex_server_udn()
         sm6 = Sm6Control(self.dlna.location_url)
         action = sm6_action_for_enqueue("replace")
         logger.info(
@@ -3516,13 +3527,12 @@ class PlexDlnaAdapter(object):
     ) -> None:
         from dlna.sm6_control import Sm6Control
         from dlna.sm6_queue import sm6_action_for_enqueue
-        from plex.dlna_browser import plex_dlna_server_udn
         from plex.url_resolver import get_url_resolver
         from settings import settings
 
         await self._ensure_sm6_ready(plex_takeover=plex_takeover)
         resolver = get_url_resolver()
-        server_udn = await plex_dlna_server_udn(settings.resolved_plex_dlna_device_url())
+        server_udn = await self._sm6_plex_server_udn()
 
         sm6 = Sm6Control(self.dlna.location_url)
         self._sm6_mark_outbound_activity(90.0)
