@@ -5,7 +5,7 @@ Requires SM6_TEST_DESCRIPTION_URL (device description.xml URL) and a playing Ple
 from the existing queue or resolver.
 
 Example:
-  set SM6_TEST_DESCRIPTION_URL=http://192.168.50.111:8050/description.xml
+  set SM6_TEST_DESCRIPTION_URL=http://<sm6-host>:8050/description.xml
   python scripts/test_sm6_playlist_edit_hardware.py --help
 """
 from __future__ import annotations
