@@ -190,6 +190,13 @@ class SubscribeManager(object):
         adapter = await adapter_by_device(device)
         if adapter.no_notice:
             return None
+        # Poll clients never see notify_device_disconnected (push-only); honor latch here.
+        if getattr(adapter, "_sm6_plex_clients_detached", False):
+            logger.debug(
+                "timeline disconnected for %s (external source latch)",
+                getattr(device, "name", device),
+            )
+            return TIMELINE_DISCONNECTED
         if adapter.state.state is None or adapter.state.state == "STOPPED" or adapter.queue is None:
             return TIMELINE_STOPPED
         state = await adapter.get_state()
@@ -216,17 +223,16 @@ class SubscribeManager(object):
         await asyncio.gather(*[sub.send(msg, device) for sub in subs])
 
     async def notify_device_disconnected(self, device):
-        subs = self.subscribers.get(device.uuid, [])
-        await asyncio.gather(*[sub.send(TIMELINE_DISCONNECTED, device) for sub in subs])
-        # Remove subscribers in background — await the gather wrapped in a coroutine
-        # (asyncio.gather returns a Future, which create_task rejects)
-        async def _cleanup():
-            await asyncio.gather(
-                *[self.remove_subscriber(sub.uuid, target_uuid=device.uuid) for sub in subs],
-                return_exceptions=True,
-            )
-        task = asyncio.create_task(_cleanup())
-        task.add_done_callback(lambda t: t.exception() if not t.cancelled() and t.exception() else None)
+        subs = list(self.subscribers.get(device.uuid, []))
+        # Drop registrations first — don't wait on push RTT/timeouts before cleanup.
+        for sub in subs:
+            await self.remove_subscriber(sub.uuid, target_uuid=device.uuid)
+        if not subs:
+            return
+        await asyncio.gather(
+            *[sub.send(TIMELINE_DISCONNECTED, device) for sub in subs],
+            return_exceptions=True,
+        )
 
     async def start(self):
         await self.notify()

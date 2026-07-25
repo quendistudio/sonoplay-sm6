@@ -42,6 +42,14 @@ def test_initial_queue_action_replace_for_transcode_playlist() -> None:
     assert action == "REPLACE"
 
 
+def test_initial_queue_action_replace_for_playlist_takeover() -> None:
+    action = initial_sm6_queue_action(
+        segment_kind="track",
+        replace_playlist_queue=True,
+    )
+    assert action == "REPLACE"
+
+
 def test_initial_queue_action_play_for_single_track() -> None:
     assert initial_sm6_queue_action(segment_kind="track") == "PLAY_NOW"
 

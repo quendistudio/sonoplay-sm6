@@ -3,8 +3,7 @@
 import asyncio
 import sys
 import types
-from contextlib import asynccontextmanager
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -47,7 +46,6 @@ _STUB_MODULES = [
     "dlna.virtual.devices",
     "dlna.virtual.volume",
     "dlna.quirks",
-    "dlna.sm6_soap_lane",
 ]
 
 for _name in _STUB_MODULES:
@@ -69,7 +67,6 @@ _utils.pms_header = MagicMock(return_value={})
 _utils.extract_value = MagicMock()
 sys.modules["plex.play_queue"].PlayQueue = MagicMock
 sys.modules["dotmap"].DotMap = MagicMock
-sys.modules["dlna.sm6_soap_lane"] = _make_stub("dlna.sm6_soap_lane")
 _sm6_control = types.ModuleType("dlna.sm6_control")
 _sm6_control.Sm6Control = MagicMock
 sys.modules["dlna.sm6_control"] = _sm6_control
@@ -102,15 +99,13 @@ def _stop_adapter(*, owned: bool, relinquished: bool) -> PlexDlnaAdapter:
     adapter._sm6_relinquished_control = relinquished
     adapter.wait_state_change_events = []
     adapter._is_sm6_renderer = MagicMock(return_value=True)
+    adapter.loop = None
 
-    @asynccontextmanager
-    async def _lane():
-        yield
-
-    adapter._sm6_transport_lane = _lane
     adapter._sm6_clear_optimistic_play = MagicMock()
     adapter._sm6_relinquish_control = MagicMock()
     adapter._finish_transport_operation = MagicMock()
+    adapter._sm6_run_control = AsyncMock()
+    adapter._sm6_control = MagicMock(return_value=MagicMock(stop=AsyncMock()))
     return adapter
 
 
@@ -125,12 +120,10 @@ def _stop_adapter(*, owned: bool, relinquished: bool) -> PlexDlnaAdapter:
 @pytest.mark.asyncio
 async def test_plex_stop_reaches_sm6_after_passive_sync(owned, relinquished) -> None:
     adapter = _stop_adapter(owned=owned, relinquished=relinquished)
-    sm6_stop = AsyncMock()
 
-    with patch("dlna.sm6_control.Sm6Control") as sm6_cls:
-        sm6_cls.return_value.stop = sm6_stop
-        await adapter.stop()
+    await adapter.stop()
 
-    sm6_stop.assert_awaited_once()
     adapter._sm6_relinquish_control.assert_called_once_with("plex_stop")
     assert adapter._sm6_sonoplay_owned_playback is False
+    adapter._sm6_run_control.assert_awaited_once()
+    assert adapter._sm6_run_control.await_args.kwargs.get("label") == "KeyPressed STOP"

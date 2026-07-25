@@ -190,3 +190,39 @@ class TestBuildTranscodeUrl:
         assert "device=dev-1" in url
         assert "32400" not in url
         assert "start.m3u8" not in url
+
+
+class TestPlayQueueServerClear:
+    def test_play_queue_id_from_container(self):
+        PlayQueue = _load_play_queue_class()
+        assert PlayQueue.play_queue_id_from_container("/playQueues/3888?own=1") == 3888
+        assert PlayQueue.play_queue_id_from_container(None) is None
+
+    @pytest.mark.asyncio
+    async def test_clear_server_play_queue(self, monkeypatch):
+        PlayQueue = _load_play_queue_class()
+        lib = FakePlexLib()
+        lib.request_headers = lambda *, accept_json=False: {"Accept": "application/json"}
+
+        class FakeResponse:
+            status = 200
+
+            async def text(self):
+                return ""
+
+        class FakeDeleteCtx:
+            def __init__(self):
+                self._url = None
+
+            async def __aenter__(self):
+                return FakeResponse()
+
+            async def __aexit__(self, *args):
+                return False
+
+        def fake_delete(url, headers=None):
+            assert "/playQueues/3888/items" in url
+            return FakeDeleteCtx()
+
+        monkeypatch.setattr("plex.play_queue.g.http.delete", fake_delete)
+        assert await PlayQueue.clear_server_play_queue(lib, 3888) is True

@@ -60,3 +60,36 @@ def test_resolve_play_didl_uses_album_container(monkeypatch):
     didl, skip = asyncio.run(resolver.resolve_play_didl(track, start_playback=True))
     assert didl == "<album-didl/>"
     assert skip == 4
+
+
+def test_playlist_track_resolves_to_track_didl_not_album(monkeypatch):
+    import asyncio
+
+    from plex.url_resolver import UrlResolver
+
+    track = SimpleNamespace(
+        ratingKey="34512",
+        parentRatingKey="34509",
+        parentTitle="Evil Empire",
+        grandparentTitle="Rage Against the Machine",
+        parentIndex=3,
+    )
+    resolver = UrlResolver("http://example/dlna")
+
+    async def fake_resolve_didl(item, *, media_kind="track"):
+        if media_kind == "track":
+            assert item.ratingKey == "34512"
+            return "<track-didl/>"
+        raise AssertionError("album DIDL should not be used for playlist items")
+
+    async def fake_ensure_ids():
+        return None
+
+    monkeypatch.setattr(resolver, "resolve_didl", fake_resolve_didl)
+    monkeypatch.setattr(resolver, "_ensure_dlna_ids", fake_ensure_ids)
+
+    didl, skip = asyncio.run(
+        resolver.resolve_play_didl(track, start_playback=True, prefer_track_didl=True),
+    )
+    assert didl == "<track-didl/>"
+    assert skip == 0

@@ -97,23 +97,24 @@ _NAVIGATOR_ID_CACHE: dict[str, str] = {}
 
 
 async def sm6_transport_key_pressed(device, key: str) -> None:
-    """Priority KeyPressed via native URL and dedicated SOAP lane."""
+    """KeyPressed via control lane (no queue preempt — play/pause/stop/skip)."""
+    from dlna.sm6_dispatcher import get_sm6_dispatcher
     from dlna.sm6_rendering_control import sm6_preferred_description_url
-    from dlna.sm6_soap_lane import priority_transport_soap
 
-    device_uuid = getattr(device, "uuid", None) or sm6_preferred_description_url(device)
+    device_uuid = str(getattr(device, "uuid", None) or sm6_preferred_description_url(device))
     description_url = sm6_preferred_description_url(device)
+    dispatcher = get_sm6_dispatcher(device_uuid, description_url)
+    sm6 = Sm6Control(description_url)
 
     async def _send() -> None:
-        await Sm6Control(description_url)._key_pressed_direct(key)
+        await sm6._key_pressed_direct(key)
 
-    await priority_transport_soap(str(device_uuid), _send)
+    await dispatcher.submit_control(_send, label=f"KeyPressed {key}")
 
 
 class Sm6Control:
     def __init__(self, description_url: str) -> None:
         self._description_url = description_url
-        self._lock = asyncio.Lock()
         self._cached_plex_navigator_id: str | None = _NAVIGATOR_ID_CACHE.get(description_url)
 
     def _remember_navigator_id(self, navigator_id: str) -> str:
@@ -252,47 +253,43 @@ class Sm6Control:
         )
 
     async def clear_queue(self) -> None:
-        async with self._lock:
-            logger.info("SM6 DeleteAll (clear internal queue)")
-            await self._post(
-                uu_playlist_invoke_url(self._description_url),
-                build_delete_all_body(),
-                DELETE_ALL_SOAP_ACTION,
-                label="DeleteAll",
-            )
+        logger.info("SM6 DeleteAll (clear internal queue)")
+        await self._post(
+            uu_playlist_invoke_url(self._description_url),
+            build_delete_all_body(),
+            DELETE_ALL_SOAP_ACTION,
+            label="DeleteAll",
+        )
 
     async def insert_playlist_track(self, *, insert_position: int, didl: str) -> None:
-        async with self._lock:
-            logger.info("SM6 InsertPlaylistTrack position=%s", insert_position)
-            await self._post(
-                reciva_radio_invoke_url(self._description_url),
-                build_insert_playlist_track_body(
-                    insert_position=insert_position,
-                    didl=didl,
-                ),
-                INSERT_PLAYLIST_TRACK_ACTION,
-                label="InsertPlaylistTrack",
-            )
+        logger.info("SM6 InsertPlaylistTrack position=%s", insert_position)
+        await self._post(
+            reciva_radio_invoke_url(self._description_url),
+            build_insert_playlist_track_body(
+                insert_position=insert_position,
+                didl=didl,
+            ),
+            INSERT_PLAYLIST_TRACK_ACTION,
+            label="InsertPlaylistTrack",
+        )
 
     async def delete_playlist_track(self, *, playlist_track_id: int) -> None:
-        async with self._lock:
-            logger.info("SM6 DeletePlaylistTrack id=%s", playlist_track_id)
-            await self._post(
-                reciva_radio_invoke_url(self._description_url),
-                build_delete_playlist_track_body(playlist_track_id=playlist_track_id),
-                DELETE_PLAYLIST_TRACK_ACTION,
-                label="DeletePlaylistTrack",
-            )
+        logger.info("SM6 DeletePlaylistTrack id=%s", playlist_track_id)
+        await self._post(
+            reciva_radio_invoke_url(self._description_url),
+            build_delete_playlist_track_body(playlist_track_id=playlist_track_id),
+            DELETE_PLAYLIST_TRACK_ACTION,
+            label="DeletePlaylistTrack",
+        )
 
     async def move_playlist_track(self, *, from_index: int, to_index: int) -> None:
-        async with self._lock:
-            logger.info("SM6 MovePlaylistTrack from=%s to=%s", from_index, to_index)
-            await self._post(
-                reciva_radio_invoke_url(self._description_url),
-                build_move_playlist_track_body(from_index=from_index, to_index=to_index),
-                MOVE_PLAYLIST_TRACK_ACTION,
-                label="MovePlaylistTrack",
-            )
+        logger.info("SM6 MovePlaylistTrack from=%s to=%s", from_index, to_index)
+        await self._post(
+            reciva_radio_invoke_url(self._description_url),
+            build_move_playlist_track_body(from_index=from_index, to_index=to_index),
+            MOVE_PLAYLIST_TRACK_ACTION,
+            label="MovePlaylistTrack",
+        )
 
     async def queue_folder(
         self,
@@ -302,39 +299,37 @@ class Sm6Control:
         server_udn: str,
         navigator_id: str | None = None,
     ) -> None:
-        async with self._lock:
-            resolved = navigator_id or await self.resolve_plex_navigator_id()
-            body = build_queue_folder_body(
-                didl=didl,
-                action=action,
-                server_udn=server_udn,
-                navigator_id=resolved,
+        resolved = navigator_id or await self.resolve_plex_navigator_id()
+        body = build_queue_folder_body(
+            didl=didl,
+            action=action,
+            server_udn=server_udn,
+            navigator_id=resolved,
+        )
+        logger.info(
+            "SM6 QueueFolder action=%s server_udn=%s navigator_id=%s",
+            action,
+            server_udn,
+            resolved,
+        )
+        xml = await self._post(
+            reciva_radio_invoke_url(self._description_url),
+            body,
+            QUEUE_FOLDER_SOAP_ACTION,
+            label="QueueFolder",
+        )
+        result = parse_queue_folder_result(xml)
+        if result == "BAD_NAVIGATOR":
+            self._cached_plex_navigator_id = None
+            _NAVIGATOR_ID_CACHE.pop(self._description_url, None)
+            raise RuntimeError(
+                f"QueueFolder: Plex navigator id={resolved!r} not recognized by the SM6"
             )
-            logger.info(
-                "SM6 QueueFolder action=%s server_udn=%s navigator_id=%s",
-                action,
-                server_udn,
-                resolved,
-            )
-            xml = await self._post(
-                reciva_radio_invoke_url(self._description_url),
-                body,
-                QUEUE_FOLDER_SOAP_ACTION,
-                label="QueueFolder",
-            )
-            result = parse_queue_folder_result(xml)
-            if result == "BAD_NAVIGATOR":
-                self._cached_plex_navigator_id = None
-                _NAVIGATOR_ID_CACHE.pop(self._description_url, None)
-                raise RuntimeError(
-                    f"QueueFolder: Plex navigator id={resolved!r} not recognized by the SM6"
-                )
-            if result != "OK":
-                raise RuntimeError(f"QueueFolder: {result or 'missing Result'}")
+        if result != "OK":
+            raise RuntimeError(f"QueueFolder: {result or 'missing Result'}")
 
     async def key_pressed(self, key: str) -> None:
-        async with self._lock:
-            await self._key_pressed_direct(key)
+        await self._key_pressed_direct(key)
 
     async def _key_pressed_direct(self, key: str) -> None:
         logger.info("SM6 KeyPressed key=%s url=%s", key, self._description_url)
@@ -367,22 +362,20 @@ class Sm6Control:
         return parse_power_state(xml)
 
     async def get_power_state(self) -> str | None:
-        async with self._lock:
-            return await self._read_power_state_unlocked()
+        return await self._read_power_state_unlocked()
 
     async def ensure_power_on(self) -> None:
         """Wake the SM6 from IDLE when Plex connects or starts playback."""
-        async with self._lock:
-            state = await self._read_power_state_unlocked()
-            if state != "IDLE":
-                return
-            logger.info("SM6 SetPowerState ON (was IDLE)")
-            await self._post(
-                reciva_radio_invoke_url(self._description_url),
-                build_set_power_state_body("ON"),
-                SET_POWER_STATE_ACTION,
-                label="SetPowerState ON",
-            )
+        state = await self._read_power_state_unlocked()
+        if state != "IDLE":
+            return
+        logger.info("SM6 SetPowerState ON (was IDLE)")
+        await self._post(
+            reciva_radio_invoke_url(self._description_url),
+            build_set_power_state_body("ON"),
+            SET_POWER_STATE_ACTION,
+            label="SetPowerState ON",
+        )
 
     async def _read_current_audio_source_id(self) -> int | None:
         xml = await self._post(
@@ -394,8 +387,7 @@ class Sm6Control:
         return parse_current_audio_source_id(xml)
 
     async def get_current_audio_source_id(self) -> int | None:
-        async with self._lock:
-            return await self._read_current_audio_source_id()
+        return await self._read_current_audio_source_id()
 
     async def ensure_media_player_source(self) -> None:
         """Switch to UPnP push audio source (id 10, AUDIO_SOURCE_MEDIA_PLAYER).
@@ -403,90 +395,84 @@ class Sm6Control:
         Without this, AVTransport reflects the native SM6 Plex browser state
         (first track in the DLNA library), not the QueueFolder queue.
         """
-        async with self._lock:
-            current = await self._read_current_audio_source_id()
-            if current == AUDIO_SOURCE_MEDIA_PLAYER:
-                logger.debug("SM6 already on Media Player source (%s)", AUDIO_SOURCE_MEDIA_PLAYER)
-                return
-            logger.info(
-                "SM6 switching audio source %s -> Media Player (%s)",
-                current,
-                AUDIO_SOURCE_MEDIA_PLAYER,
-            )
-            await self._post(
-                reciva_radio_invoke_url(self._description_url),
-                build_set_audio_source_by_number_body(AUDIO_SOURCE_MEDIA_PLAYER),
-                SET_AUDIO_SOURCE_BY_NUMBER_ACTION,
-                label="SetAudioSourceByNumber",
-            )
-            await self._post(
-                simple_remote_invoke_url(self._description_url),
-                build_key_pressed_body(KEY_INFO),
-                SIMPLE_REMOTE_SOAP_ACTION,
-                label="KeyPressed INFO",
-            )
+        current = await self._read_current_audio_source_id()
+        if current == AUDIO_SOURCE_MEDIA_PLAYER:
+            logger.debug("SM6 already on Media Player source (%s)", AUDIO_SOURCE_MEDIA_PLAYER)
+            return
+        logger.info(
+            "SM6 switching audio source %s -> Media Player (%s)",
+            current,
+            AUDIO_SOURCE_MEDIA_PLAYER,
+        )
+        await self._post(
+            reciva_radio_invoke_url(self._description_url),
+            build_set_audio_source_by_number_body(AUDIO_SOURCE_MEDIA_PLAYER),
+            SET_AUDIO_SOURCE_BY_NUMBER_ACTION,
+            label="SetAudioSourceByNumber",
+        )
+        await self._post(
+            simple_remote_invoke_url(self._description_url),
+            build_key_pressed_body(KEY_INFO),
+            SIMPLE_REMOTE_SOAP_ACTION,
+            label="KeyPressed INFO",
+        )
 
     async def get_playlist_length(self) -> int:
-        async with self._lock:
-            xml = await self._post(
-                reciva_radio_invoke_url(self._description_url),
-                build_get_playlist_length_body(),
-                GET_PLAYLIST_LENGTH_ACTION,
-                label="GetPlaylistLength",
-            )
-            return parse_playlist_length(xml)
+        xml = await self._post(
+            reciva_radio_invoke_url(self._description_url),
+            build_get_playlist_length_body(),
+            GET_PLAYLIST_LENGTH_ACTION,
+            label="GetPlaylistLength",
+        )
+        return parse_playlist_length(xml)
 
     async def get_media_queue_index(self) -> int:
-        async with self._lock:
-            xml = await self._post(
+        xml = await self._post(
+            reciva_radio_invoke_url(self._description_url),
+            build_get_media_queue_index_body(),
+            GET_MEDIA_QUEUE_INDEX_ACTION,
+            label="GetMediaQueueIndex",
+        )
+        return parse_media_queue_index(xml)
+
+    async def get_current_playlist_track_id(self) -> int:
+        xml = await self._post(
+            reciva_radio_invoke_url(self._description_url),
+            build_get_current_playlist_track_body(),
+            GET_CURRENT_PLAYLIST_TRACK_ACTION,
+            label="GetCurrentPlaylistTrack",
+        )
+        return parse_current_playlist_track_id(xml)
+
+    async def get_current_queue_position(self) -> tuple[int, int]:
+        """Read current track and queue index (parallel SOAP requests)."""
+        index_xml, current_xml = await asyncio.gather(
+            self._post(
                 reciva_radio_invoke_url(self._description_url),
                 build_get_media_queue_index_body(),
                 GET_MEDIA_QUEUE_INDEX_ACTION,
                 label="GetMediaQueueIndex",
-            )
-            return parse_media_queue_index(xml)
-
-    async def get_current_playlist_track_id(self) -> int:
-        async with self._lock:
-            xml = await self._post(
+            ),
+            self._post(
                 reciva_radio_invoke_url(self._description_url),
                 build_get_current_playlist_track_body(),
                 GET_CURRENT_PLAYLIST_TRACK_ACTION,
                 label="GetCurrentPlaylistTrack",
-            )
-            return parse_current_playlist_track_id(xml)
-
-    async def get_current_queue_position(self) -> tuple[int, int]:
-        """Read current track and queue index under one lock (parallel SOAP requests)."""
-        async with self._lock:
-            index_xml, current_xml = await asyncio.gather(
-                self._post(
-                    reciva_radio_invoke_url(self._description_url),
-                    build_get_media_queue_index_body(),
-                    GET_MEDIA_QUEUE_INDEX_ACTION,
-                    label="GetMediaQueueIndex",
-                ),
-                self._post(
-                    reciva_radio_invoke_url(self._description_url),
-                    build_get_current_playlist_track_body(),
-                    GET_CURRENT_PLAYLIST_TRACK_ACTION,
-                    label="GetCurrentPlaylistTrack",
-                ),
-            )
-            return (
-                parse_current_playlist_track_id(current_xml),
-                parse_media_queue_index(index_xml),
-            )
+            ),
+        )
+        return (
+            parse_current_playlist_track_id(current_xml),
+            parse_media_queue_index(index_xml),
+        )
 
     async def set_current_playlist_track(self, track_id: int) -> None:
-        async with self._lock:
-            logger.info("SM6 SetCurrentPlaylistTrack track_id=%s", track_id)
-            await self._post(
-                reciva_radio_invoke_url(self._description_url),
-                build_set_current_playlist_track_body(track_id=track_id),
-                SET_CURRENT_PLAYLIST_TRACK_ACTION,
-                label="SetCurrentPlaylistTrack",
-            )
+        logger.info("SM6 SetCurrentPlaylistTrack track_id=%s", track_id)
+        await self._post(
+            reciva_radio_invoke_url(self._description_url),
+            build_set_current_playlist_track_body(track_id=track_id),
+            SET_CURRENT_PLAYLIST_TRACK_ACTION,
+            label="SetCurrentPlaylistTrack",
+        )
 
     async def get_playlist_track_details(
         self,
@@ -494,18 +480,17 @@ class Sm6Control:
         start_track_id: int = 0,
         track_count: int | None = None,
     ) -> list[Sm6PlaylistEntry]:
-        async with self._lock:
-            count = track_count if track_count is not None else max(1, await self._get_playlist_length_unlocked())
-            xml = await self._post(
-                reciva_radio_invoke_url(self._description_url),
-                build_get_playlist_track_details_body(
-                    start_track_id=start_track_id,
-                    track_count=count,
-                ),
-                GET_PLAYLIST_TRACK_DETAILS_ACTION,
-                label="GetPlaylistTrackDetails",
-            )
-            return parse_playlist_track_details(xml)
+        count = track_count if track_count is not None else max(1, await self._get_playlist_length_unlocked())
+        xml = await self._post(
+            reciva_radio_invoke_url(self._description_url),
+            build_get_playlist_track_details_body(
+                start_track_id=start_track_id,
+                track_count=count,
+            ),
+            GET_PLAYLIST_TRACK_DETAILS_ACTION,
+            label="GetPlaylistTrackDetails",
+        )
+        return parse_playlist_track_details(xml)
 
     async def _get_playlist_length_unlocked(self) -> int:
         xml = await self._post(
@@ -518,110 +503,105 @@ class Sm6Control:
 
     async def read_playlist_state(self, *, fetch_tracks: bool = True) -> Sm6PlaylistState:
         """Full SM6 queue state (position + track details)."""
-        async with self._lock:
-            length = await self._get_playlist_length_unlocked()
-            index_xml = await self._post(
+        length = await self._get_playlist_length_unlocked()
+        index_xml = await self._post(
+            reciva_radio_invoke_url(self._description_url),
+            build_get_media_queue_index_body(),
+            GET_MEDIA_QUEUE_INDEX_ACTION,
+            label="GetMediaQueueIndex",
+        )
+        current_xml = await self._post(
+            reciva_radio_invoke_url(self._description_url),
+            build_get_current_playlist_track_body(),
+            GET_CURRENT_PLAYLIST_TRACK_ACTION,
+            label="GetCurrentPlaylistTrack",
+        )
+        media_queue_index = parse_media_queue_index(index_xml)
+        current_track_id = parse_current_playlist_track_id(current_xml)
+        tracks: list[Sm6PlaylistEntry] = []
+        if fetch_tracks and length > 0:
+            details_xml = await self._post(
                 reciva_radio_invoke_url(self._description_url),
-                build_get_media_queue_index_body(),
-                GET_MEDIA_QUEUE_INDEX_ACTION,
-                label="GetMediaQueueIndex",
+                build_get_playlist_track_details_body(
+                    start_track_id=0,
+                    track_count=length,
+                ),
+                GET_PLAYLIST_TRACK_DETAILS_ACTION,
+                label="GetPlaylistTrackDetails",
             )
-            current_xml = await self._post(
-                reciva_radio_invoke_url(self._description_url),
-                build_get_current_playlist_track_body(),
-                GET_CURRENT_PLAYLIST_TRACK_ACTION,
-                label="GetCurrentPlaylistTrack",
-            )
-            media_queue_index = parse_media_queue_index(index_xml)
-            current_track_id = parse_current_playlist_track_id(current_xml)
-            tracks: list[Sm6PlaylistEntry] = []
-            if fetch_tracks and length > 0:
-                details_xml = await self._post(
+            tracks = parse_playlist_track_details(details_xml)
+            track_ids = {entry.track_id for entry in tracks}
+            if current_track_id not in track_ids:
+                current_xml = await self._post(
                     reciva_radio_invoke_url(self._description_url),
                     build_get_playlist_track_details_body(
-                        start_track_id=0,
-                        track_count=length,
+                        start_track_id=current_track_id,
+                        track_count=1,
                     ),
                     GET_PLAYLIST_TRACK_DETAILS_ACTION,
                     label="GetPlaylistTrackDetails",
                 )
-                tracks = parse_playlist_track_details(details_xml)
-                track_ids = {entry.track_id for entry in tracks}
-                if current_track_id not in track_ids:
-                    current_xml = await self._post(
-                        reciva_radio_invoke_url(self._description_url),
-                        build_get_playlist_track_details_body(
-                            start_track_id=current_track_id,
-                            track_count=1,
-                        ),
-                        GET_PLAYLIST_TRACK_DETAILS_ACTION,
-                        label="GetPlaylistTrackDetails",
+                current_entries = parse_playlist_track_details(current_xml)
+                if current_entries:
+                    merged = {entry.track_id: entry for entry in tracks}
+                    for entry in current_entries:
+                        merged[entry.track_id] = entry
+                    ordered: list[Sm6PlaylistEntry] = list(tracks)
+                    known = {entry.track_id for entry in tracks}
+                    for entry in current_entries:
+                        if entry.track_id in known:
+                            continue
+                        insert_at = media_queue_index
+                        if 0 <= insert_at <= len(ordered):
+                            ordered.insert(insert_at, entry)
+                        else:
+                            ordered.append(entry)
+                    tracks = ordered
+                    logger.info(
+                        "SM6 playlist: merged missing current track_id=%s (%s) at index=%s",
+                        current_track_id,
+                        current_entries[0].title,
+                        media_queue_index,
                     )
-                    current_entries = parse_playlist_track_details(current_xml)
-                    if current_entries:
-                        merged = {entry.track_id: entry for entry in tracks}
-                        for entry in current_entries:
-                            merged[entry.track_id] = entry
-                        ordered: list[Sm6PlaylistEntry] = list(tracks)
-                        known = {entry.track_id for entry in tracks}
-                        for entry in current_entries:
-                            if entry.track_id in known:
-                                continue
-                            insert_at = media_queue_index
-                            if 0 <= insert_at <= len(ordered):
-                                ordered.insert(insert_at, entry)
-                            else:
-                                ordered.append(entry)
-                        tracks = ordered
-                        logger.info(
-                            "SM6 playlist: merged missing current track_id=%s (%s) at index=%s",
-                            current_track_id,
-                            current_entries[0].title,
-                            media_queue_index,
-                        )
-            return Sm6PlaylistState(
-                length=length,
-                current_track_id=current_track_id,
-                media_queue_index=media_queue_index,
-                tracks=tuple(tracks),
-            )
+        return Sm6PlaylistState(
+            length=length,
+            current_track_id=current_track_id,
+            media_queue_index=media_queue_index,
+            tracks=tuple(tracks),
+        )
 
     async def get_shuffle(self) -> bool:
-        async with self._lock:
-            xml = await self._post(
-                uu_playlist_invoke_url(self._description_url),
-                build_get_shuffle_body(),
-                GET_SHUFFLE_SOAP_ACTION,
-                label="Shuffle",
-            )
-            return parse_shuffle_response(xml)
+        xml = await self._post(
+            uu_playlist_invoke_url(self._description_url),
+            build_get_shuffle_body(),
+            GET_SHUFFLE_SOAP_ACTION,
+            label="Shuffle",
+        )
+        return parse_shuffle_response(xml)
 
     async def get_repeat(self) -> bool:
-        async with self._lock:
-            xml = await self._post(
-                uu_playlist_invoke_url(self._description_url),
-                build_get_repeat_body(),
-                GET_REPEAT_SOAP_ACTION,
-                label="Repeat",
-            )
-            return parse_repeat_response(xml)
+        xml = await self._post(
+            uu_playlist_invoke_url(self._description_url),
+            build_get_repeat_body(),
+            GET_REPEAT_SOAP_ACTION,
+            label="Repeat",
+        )
+        return parse_repeat_response(xml)
 
     async def set_shuffle(self, enabled: bool) -> None:
-        async with self._lock:
-            logger.info("SM6 SetShuffle %s", "on" if enabled else "off")
-            await self._post(
-                uu_playlist_invoke_url(self._description_url),
-                build_set_shuffle_body(enabled),
-                SET_SHUFFLE_SOAP_ACTION,
-                label="SetShuffle",
-            )
+        logger.info("SM6 SetShuffle %s", "on" if enabled else "off")
+        await self._post(
+            uu_playlist_invoke_url(self._description_url),
+            build_set_shuffle_body(enabled),
+            SET_SHUFFLE_SOAP_ACTION,
+            label="SetShuffle",
+        )
 
     async def set_repeat(self, enabled: bool) -> None:
-        async with self._lock:
-            logger.info("SM6 SetRepeat %s", "on" if enabled else "off")
-            await self._post(
-                uu_playlist_invoke_url(self._description_url),
-                build_set_repeat_body(enabled),
-                SET_REPEAT_SOAP_ACTION,
-                label="SetRepeat",
-            )
+        logger.info("SM6 SetRepeat %s", "on" if enabled else "off")
+        await self._post(
+            uu_playlist_invoke_url(self._description_url),
+            build_set_repeat_body(enabled),
+            SET_REPEAT_SOAP_ACTION,
+            label="SetRepeat",
+        )

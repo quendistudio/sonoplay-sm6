@@ -337,26 +337,106 @@ class PlayQueue(object):
         direction = -1 if reverse else 1
         return await self.track(await self.selected_offset() + direction)
 
+    @staticmethod
+    def play_queue_id_from_container(container_key: str | None) -> int | None:
+        import re
+
+        match = re.search(r"/playQueues/(\d+)", str(container_key or ""))
+        if not match:
+            return None
+        return int(match.group(1))
+
+    @classmethod
+    async def clear_server_play_queue(cls, plex_lib, play_queue_id: int) -> bool:
+        """Remove all items from a Plex playQueue (DELETE /playQueues/{id}/items)."""
+        path = f"/playQueues/{int(play_queue_id)}/items"
+        url = plex_lib.build_url(path)
+        headers = plex_lib.request_headers(accept_json=True)
+        async with g.http.delete(url, headers=headers) as res:
+            if res.status >= 400:
+                body = await res.text()
+                logger.warning(
+                    "playQueue clear failed (%s) id=%s: %s",
+                    res.status,
+                    play_queue_id,
+                    body[:500] if body else res.reason,
+                )
+                return False
+        logger.info("playQueue cleared on Plex server id=%s", play_queue_id)
+        return True
+
+    async def clear_on_server(self) -> bool:
+        """Clear this playQueue on the Plex server."""
+        play_queue_id = self.play_queue_id_from_container(self.container_key)
+        if self.info is not None and getattr(self.info, "playQueueID", None) is not None:
+            play_queue_id = int(self.info.playQueueID)
+        if play_queue_id is None:
+            return False
+        return await self.clear_server_play_queue(self.plex_lib, play_queue_id)
+
+    @staticmethod
+    def _rating_key_from_metadata_key(key: str) -> str | None:
+        rating_from_key = key.rstrip("/").rsplit("/", 1)[-1]
+        return rating_from_key if rating_from_key.isdigit() else None
+
     def _track_matches_key(self, track, key: str) -> bool:
         if track.key == key:
             return True
-        rating_from_key = key.rstrip("/").rsplit("/", 1)[-1]
-        return rating_from_key.isdigit() and str(getattr(track, "ratingKey", "")) == rating_from_key
+        rating_from_key = self._rating_key_from_metadata_key(key)
+        return rating_from_key is not None and str(getattr(track, "ratingKey", "")) == rating_from_key
+
+    def _parent_matches_key(self, track, key: str) -> bool:
+        """Plexamp thematic playQueues may send the first track's album key."""
+        rating_from_key = self._rating_key_from_metadata_key(key)
+        if rating_from_key is None:
+            return False
+        return str(getattr(track, "parentRatingKey", "")) == rating_from_key
+
+    async def _ensure_all_tracks_loaded(self) -> None:
+        total = await self.total_count()
+        if math.isinf(total):
+            return
+        while True:
+            last_offset = self.last_offset
+            if last_offset is None or last_offset + 1 >= total:
+                break
+            if not await self.more(after=True):
+                break
 
     async def select_track_key(self, key) -> bool:
-        tracks = await self.available_tracks()
-        for idx, track in enumerate(tracks):
-            if self._track_matches_key(track, key):
+        await self.get_info()
+
+        async def _try_select(tracks) -> bool:
+            for idx, track in enumerate(tracks):
+                if not (self._track_matches_key(track, key) or self._parent_matches_key(track, key)):
+                    continue
                 offset = idx + (self.start_offset or 0)
                 await self.set_selected_offset(offset)
+                if self._track_matches_key(track, key):
+                    matched = "track"
+                else:
+                    matched = "parent"
                 logger.info(
-                    "queue selected offset=%s key=%s title=%s ratingKey=%s",
+                    "queue selected offset=%s key=%s match=%s title=%s ratingKey=%s parentRatingKey=%s",
                     offset,
                     key,
+                    matched,
                     getattr(track, "title", "?"),
                     getattr(track, "ratingKey", "?"),
+                    getattr(track, "parentRatingKey", "?"),
                 )
                 return True
+            return False
+
+        tracks = await self.available_tracks()
+        if await _try_select(tracks):
+            return True
+
+        await self._ensure_all_tracks_loaded()
+        tracks = await self.available_tracks()
+        if await _try_select(tracks):
+            return True
+
         logger.warning(
             "no queue track matched key=%s (searched %d loaded tracks, start_offset=%s)",
             key,
@@ -691,15 +771,16 @@ class PlayQueue(object):
     async def select_track_by_metadata(
         self,
         *,
-        title: str,
+        rating_key: str,
+        title: str | None = None,
         artist: str | None = None,
         album: str | None = None,
     ) -> bool:
-        """Select a track by metadata (SM6 queue → Plex playQueue sync)."""
+        """Select a track in the playQueue by exact ratingKey only."""
         await self.get_info()
-        title_cf = str(title).casefold()
-        artist_cf = str(artist).casefold() if artist else None
-        album_cf = str(album).casefold() if album else None
+        key = str(rating_key or "").strip()
+        if not key.isdigit():
+            return False
         total = await self.total_count()
         if math.isinf(total):
             total = await self.available_count()
@@ -708,22 +789,15 @@ class PlayQueue(object):
                 track = await self.track(offset)
             except (IndexError, ValueError):
                 break
-            if str(getattr(track, "title", "")).casefold() != title_cf:
-                continue
-            if album_cf and str(getattr(track, "parentTitle", "")).casefold() != album_cf:
-                continue
-            if artist_cf and str(getattr(track, "grandparentTitle", "")).casefold() != artist_cf:
-                continue
-            await self.set_selected_offset(offset)
-            logger.info(
-                "queue matched metadata offset=%s title=%s artist=%s album=%s ratingKey=%s",
-                offset,
-                title,
-                artist,
-                album,
-                getattr(track, "ratingKey", "?"),
-            )
-            return True
+            if str(getattr(track, "ratingKey", "")) == key:
+                await self.set_selected_offset(offset)
+                logger.info(
+                    "queue matched ratingKey offset=%s ratingKey=%s title=%s",
+                    offset,
+                    key,
+                    getattr(track, "title", title or "?"),
+                )
+                return True
         return False
 
     async def get_track_info(self):

@@ -21,7 +21,10 @@ from .dlna_browser import (
 )
 from .dlna_stream_cache import (
     StreamCacheEntry,
+    embed_rating_key_in_stream_url,
+    normalize_stream_url,
     object_id_from_stream_url,
+    patch_didl_res_urls,
     rating_key_from_uri,
 )
 
@@ -186,14 +189,15 @@ class UrlResolver:
 
     async def _store_stream(self, track, item) -> str:
         rating_key = str(getattr(track, "ratingKey", "") or "")
-        oid = object_id_from_stream_url(item.url)
-        entry = StreamCacheEntry.from_track(track, item.url, object_id=oid)
+        url = embed_rating_key_in_stream_url(item.url, rating_key)
+        oid = object_id_from_stream_url(url)
+        entry = StreamCacheEntry.from_track(track, url, object_id=oid)
         async with self._cache_lock:
             self._cache[rating_key] = entry
             if oid:
                 self._object_to_rating[oid] = rating_key
             self._persist_cache_unlocked()
-        return item.url
+        return url
 
     async def _pick_album_track(self, track, album_title: str, artist: str | None):
         title = getattr(track, "title", None)
@@ -346,15 +350,13 @@ class UrlResolver:
 
         raise LookupError(f"DLNA URL not found for ratingKey {rating_key} ({title})")
 
-    def rating_key_for_stream_url(self, url: str | None) -> str | None:
-        """Plex ratingKey from a Plex DLNA /object/… URL (cache or object id)."""
+    def rating_key_from_dlna_cache_only(self, url: str | None) -> str | None:
+        """Plex ratingKey from DLNA cache / object_id map only (no URI-embedded parse)."""
         if not url:
             return None
-        embedded = rating_key_from_uri(url)
-        if embedded:
-            return embedded
+        normalized = normalize_stream_url(url)
         for rating_key, entry in self._cache.items():
-            if entry.url == url:
+            if entry.url == url or normalize_stream_url(entry.url) == normalized:
                 return rating_key
         object_id = object_id_from_stream_url(url)
         if not object_id:
@@ -366,6 +368,33 @@ class UrlResolver:
             if entry.object_id == object_id:
                 return rating_key
         return None
+
+    def rating_key_for_stream_url(self, url: str | None) -> str | None:
+        """Plex ratingKey from TrackURI (embedded sources, then DLNA cache)."""
+        if not url:
+            return None
+        embedded = rating_key_from_uri(url)
+        if embedded:
+            return embedded
+        return self.rating_key_from_dlna_cache_only(url)
+
+    async def tag_didl_rating_keys(self, didl: str, tracks: list) -> str:
+        """Tag every ``<res>`` in an album DIDL with Plex ratingKeys."""
+        mapping: dict[str, str] = {}
+        for track in tracks:
+            rating_key = str(getattr(track, "ratingKey", "") or "")
+            if not rating_key.isdigit():
+                continue
+            try:
+                stream_url = await self.resolve_stream_url(track)
+            except LookupError:
+                continue
+            object_id = object_id_from_stream_url(stream_url)
+            if object_id:
+                mapping[object_id] = rating_key
+        if not mapping:
+            return didl
+        return patch_didl_res_urls(didl, mapping)
 
     async def resolve_didl(self, item, *, media_kind: str = "track") -> str:
         """Plex DLNA DIDL for SM6 QueueFolder (album or track)."""
@@ -410,7 +439,10 @@ class UrlResolver:
             raise LookupError("Track without ratingKey")
         cache_key = f"track:{rating_key}"
         if cache_key in self._didl_cache:
-            return self._didl_cache[cache_key]
+            return patch_didl_res_urls(
+                self._didl_cache[cache_key],
+                default_rating_key=rating_key,
+            )
 
         album_title = getattr(track, "parentTitle", None)
         track_title = getattr(track, "title", None)
@@ -432,6 +464,7 @@ class UrlResolver:
             artist=str(artist) if artist else None,
         )
         didl = await self._browser.browse_object_didl(dlna_item.object_id)
+        didl = patch_didl_res_urls(didl, {dlna_item.object_id: rating_key})
         self._didl_cache[cache_key] = didl
         await self._persist_cache()
         logger.info(
@@ -448,17 +481,23 @@ class UrlResolver:
         *,
         media_kind: str = "track",
         start_playback: bool = True,
+        prefer_track_didl: bool = False,
     ) -> tuple[str, int]:
         """QueueFolder DIDL for SM6 playback (album container when possible).
 
         Cambridge Connect loads ``object.container.album.musicAlbum`` for album
         playback; track-level ``musicTrack`` items use a left-aligned layout on the SM6.
+        Multi-track playlists must enqueue one ``musicTrack`` per QueueFolder APPEND.
         """
         if media_kind == "album":
             didl = await self.resolve_didl(item, media_kind="album")
             return didl, 0
 
         track = item
+        if prefer_track_didl:
+            didl = await self.resolve_didl(track, media_kind="track")
+            return didl, 0
+
         album_key = album_rating_key_from_track(track)
         if start_playback and album_key:
             from types import SimpleNamespace

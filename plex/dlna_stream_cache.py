@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import re
+import xml.sax.saxutils
 from dataclasses import asdict, dataclass
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 _RATING_KEY_PATH = re.compile(r"/library/metadata/(\d+)(?:/|$|\?)")
+_RES_TAG = re.compile(r"(<res[^>]*>)(.*?)(</res>)", re.S)
 
 
 @dataclass
@@ -87,23 +89,101 @@ def object_id_from_stream_url(url: str | None) -> str | None:
     return url.split("/object/", 1)[1].split("/", 1)[0]
 
 
-def rating_key_from_uri(url: str | None) -> str | None:
-    """Extract Plex ratingKey embedded in SM6 TrackURI when present."""
+def normalize_stream_url(url: str | None) -> str:
+    """Strip sonoplay ``ratingKey`` query param so tagged and raw URLs match."""
+    if not url:
+        return ""
+    parsed = urlparse(str(url).strip())
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    filtered = {
+        name: values for name, values in query.items() if name.casefold() != "ratingkey"
+    }
+    return urlunparse(parsed._replace(query=urlencode(filtered, doseq=True), fragment=""))
+
+
+def embed_rating_key_in_stream_url(url: str | None, rating_key: str | None) -> str:
+    """Append ``?ratingKey=`` to Plex DLNA stream URLs when absent (SM6 TrackURI tagging)."""
+    if not url or not rating_key:
+        return str(url or "")
+    text = str(url).strip()
+    key = str(rating_key).strip()
+    if not text or not key.isdigit() or rating_key_from_query_param(text):
+        return text
+    parsed = urlparse(text)
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    query["ratingKey"] = [key]
+    return urlunparse(parsed._replace(query=urlencode(query, doseq=True), fragment=""))
+
+
+def patch_didl_res_urls(
+    didl: str,
+    object_to_rating_key: dict[str, str] | None = None,
+    *,
+    default_rating_key: str | None = None,
+) -> str:
+    """Embed ``ratingKey`` in every DIDL ``<res>`` URL (track or album container)."""
+    mapping = object_to_rating_key or {}
+
+    def rating_key_for_url(stream_url: str) -> str | None:
+        object_id = object_id_from_stream_url(stream_url)
+        if object_id and object_id in mapping:
+            return mapping[object_id]
+        return default_rating_key
+
+    def replace_res(match: re.Match[str]) -> str:
+        open_tag, raw_url, close_tag = match.groups()
+        stream_url = raw_url.strip()
+        rating_key = rating_key_for_url(stream_url)
+        if not rating_key:
+            return match.group(0)
+        tagged = embed_rating_key_in_stream_url(stream_url, rating_key)
+        if tagged == stream_url:
+            return match.group(0)
+        return f"{open_tag}{xml.sax.saxutils.escape(tagged)}{close_tag}"
+
+    return _RES_TAG.sub(replace_res, didl)
+
+
+def rating_key_from_query_param(url: str | None) -> str | None:
+    """``?ratingKey=`` query param (SonoPlay, SM6, or any third-party tagger)."""
     if not url:
         return None
-    text = str(url).strip()
-    if not text:
-        return None
-    parsed = urlparse(text)
+    parsed = urlparse(str(url).strip())
     for name, values in parse_qs(parsed.query).items():
         if name.casefold() == "ratingkey" and values:
             candidate = str(values[0]).strip()
             if candidate.isdigit():
                 return candidate
-    match = _RATING_KEY_PATH.search(text)
+    return None
+
+
+def rating_key_from_pms_uri(url: str | None) -> str | None:
+    """PMS metadata path: ``server://…/library/metadata/{id}`` or ``/library/metadata/{id}``."""
+    if not url:
+        return None
+    match = _RATING_KEY_PATH.search(str(url).strip())
     if match:
         return match.group(1)
     return None
+
+
+def rating_key_from_sonoplay_transcode_object(url: str | None) -> str | None:
+    """SonoPlay transcode proxy object id ``sonoplay-tc-{ratingKey}``."""
+    if not url:
+        return None
+    sonoplay = re.search(r"sonoplay-tc-(\d+)", str(url).strip(), re.I)
+    if sonoplay:
+        return sonoplay.group(1)
+    return None
+
+
+def rating_key_from_uri(url: str | None) -> str | None:
+    """Extract Plex ratingKey embedded in SM6 TrackURI when present."""
+    return (
+        rating_key_from_query_param(url)
+        or rating_key_from_pms_uri(url)
+        or rating_key_from_sonoplay_transcode_object(url)
+    )
 
 
 def is_plex_dlna_stream_uri(url: str | None) -> bool:

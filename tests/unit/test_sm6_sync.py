@@ -33,6 +33,15 @@ def test_rating_key_from_dlna_object_url():
     assert is_plex_resolvable_uri(url)
 
 
+def test_rating_key_from_tagged_dlna_object_url():
+    url = f"http://plex.example:32469/object/9001/track.flac?ratingKey={FAKE_TRACK_KEY_A}"
+    assert rating_key_from_uri(url) == FAKE_TRACK_KEY_A
+
+
+def test_rating_key_from_transcode_object_id():
+    assert rating_key_from_uri("http://host/object/sonoplay-tc-900001/track.mp3") == "900001"
+
+
 def test_non_plex_uri_is_not_resolvable():
     assert not is_plex_resolvable_uri("http://radio.example/stream.mp3")
     assert rating_key_from_uri("http://radio.example/stream.mp3") is None

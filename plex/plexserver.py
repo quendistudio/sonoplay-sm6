@@ -44,7 +44,7 @@ from dlna import (
     UnknownMemberError,
 )
 from typing import List, Optional, Dict, Any
-from plex.subscribe import sub_man
+from plex.subscribe import sub_man, TIMELINE_DISCONNECTED
 from utils import plex_server_response_headers, xml2dict, timeline_poll_headers, g, require_valid_uuid
 from settings import settings
 import asyncio
@@ -120,6 +120,9 @@ async def handle_device_unreachable(request: Request, exc: ClientConnectionError
     )
 
 
+
+
+
 async def on_new_dlna_device(location_url):
     from dlna.reject_cache import is_permanent_reject, is_rejected, normalize_location_url, remember_rejection
     from dlna.sm6_rendering_control import is_sm6_proxy_url
@@ -132,10 +135,11 @@ async def on_new_dlna_device(location_url):
     if is_probable_plex_dlna_url(location_url):
         remember_plex_dlna_device_url(location_url)
 
-    logger.info("got new dlna device location url %s", location_url)
     for d in devices:
         if d.location_url == location_url:
             return
+
+    logger.info("got new dlna device location url %s", location_url)
     device = DlnaDevice(location_url)
     try:
         await device.get_data()
@@ -167,7 +171,21 @@ async def on_new_dlna_device(location_url):
                 location_url,
             )
             devices.remove(existing)
+            unregister_gdm_for_device(existing.uuid)
+            existing.stop_subscribe()
+            from plex.adapters import get_adapter_if_present, remove_adapter
+
+            old_adapter = await get_adapter_if_present(existing.uuid)
+            if old_adapter is not None:
+                old_adapter.state._thread_should_stop = True
+                await remove_adapter(old_adapter)
             break
+        logger.debug(
+            "ignoring duplicate SSDP for %s (uuid %s already registered)",
+            device.name,
+            device.uuid,
+        )
+        return
 
     logger.info("got new dlna device from %s", device.name)
     asyncio.create_task(device.loop_subscribe(), name=f"dlna sub {device.name}")
@@ -175,12 +193,35 @@ async def on_new_dlna_device(location_url):
     adapter = await adapter_by_device(device)
     settings.mark_device_status(device.uuid, "online")
     adapter.start_plex_tv_notify()
+    register_gdm_for_device(device)
+
+
+_gdm_by_uuid: dict[str, PlexGDM] = {}
+
+
+def register_gdm_for_device(device) -> None:
+    """One GDM socket per device uuid — stop any previous instance first."""
+    uuid = device.uuid
+    if not uuid:
+        return
+    existing = _gdm_by_uuid.pop(uuid, None)
+    if existing is not None:
+        existing.stop()
     gdm = PlexGDM(device)
     gdm.run()
-    _gdm_instances.append(gdm)
+    _gdm_by_uuid[uuid] = gdm
 
 
-_gdm_instances: list = []
+def unregister_gdm_for_device(device_uuid: str | None) -> None:
+    if not device_uuid:
+        return
+    gdm = _gdm_by_uuid.pop(device_uuid, None)
+    if gdm is not None:
+        gdm.stop()
+
+
+def _all_gdm_instances() -> list:
+    return list(_gdm_by_uuid.values())
 
 dlna_discover = DlnaDiscover(on_new_dlna_device)
 
@@ -278,12 +319,12 @@ async def on_shutdown():
     await sub_man.stop_cleanup_task()
     sub_man.stop()
     # Stop all GDM instances to release UDP sockets
-    for gdm in _gdm_instances:
+    for gdm in _all_gdm_instances():
         try:
             gdm.stop()
         except Exception:
             logger.debug("Error stopping GDM instance", exc_info=True)
-    _gdm_instances.clear()
+    _gdm_by_uuid.clear()
     stop_tasks = []
     from plex.device_profiles import needs_plex_dlna_stream_url
 
@@ -1086,6 +1127,11 @@ async def timeline_poll(request: Request,
         if hasattr(device, "loop_subscribe"):
             asyncio.create_task(device.loop_subscribe())
         adapter = await adapter_by_device(device, request.query_params)
+        # Detached: answer disconnected immediately — do not wait=1 / volume sync /
+        # PMS notify, or Plexamp stays bound to SM6 without a usable timeline.
+        if getattr(adapter, "_sm6_plex_clients_detached", False):
+            msg = TIMELINE_DISCONNECTED.format(command_id=commandID)
+            return await build_response(msg, device=device, headers=timeline_poll_headers(device))
         if adapter._is_sm6_renderer() and not await adapter._sm6_should_skip_volume_poll():
             now = time.monotonic()
             last = getattr(adapter, "_sm6_volume_timeline_refresh_at", 0.0)
@@ -1128,6 +1174,9 @@ async def subscribe(request: Request,
     device = await get_device_by_uuid(target_uuid)
     if device is None:
         raise HTTPException(404, f"device not found {target_uuid}")
+    adapter = await adapter_by_device(device, request.query_params)
+    if hasattr(adapter, "_sm6_on_plex_client_subscribe"):
+        await adapter._sm6_on_plex_client_subscribe()
     await sub_man.add_subscriber(target_uuid, client_uuid, request.client.host, port, protocol=protocol, command_id=commandID)
     return await build_response(XML_OK, target_uuid=target_uuid)
 

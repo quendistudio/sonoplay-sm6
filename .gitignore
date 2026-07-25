@@ -4,6 +4,7 @@ docs/
 # ── Local scratch / logs pasted for debugging (never commit) ──
 .temp/
 tests/fixtures/private/
+.jcodemunch.jsonc
 
 # ── Python artifacts ──
 __pycache__/

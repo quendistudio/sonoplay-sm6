@@ -136,13 +136,14 @@ async def _apply_set_volume(device, clamped: int) -> bool:
             clamped,
             url,
         )
-        return await sm6_rc_action(
-            device,
-            "SetVolume",
-            InstanceID=0,
-            Channel="Master",
-            DesiredVolume=clamped,
-        )
+        from dlna.sm6_dispatcher import get_sm6_dispatcher
+
+        dispatcher = get_sm6_dispatcher(uuid, sm6_preferred_description_url(device))
+
+        async def _send() -> bool:
+            return await _sm6_rc_post(device, "SetVolume", InstanceID=0, Channel="Master", DesiredVolume=clamped)
+
+        return await dispatcher.submit_control(_send, label=f"SetVolume {clamped}")
     finally:
         _VOLUME_WRITING[uuid] = False
         if uuid in _PENDING_VOLUME:
@@ -161,11 +162,23 @@ async def _rendering_control_url(device) -> str | None:
     service = device._get_service(UPNP_RC_SERVICE_TYPE)
     if service is None:
         return None
-    return service.control_url
+    url = str(service.control_url or "")
+    preferred = sm6_preferred_description_url(device)
+    if preferred and is_sm6_proxy_url(url):
+        from urllib.parse import urlparse, urlunparse
+
+        pref = urlparse(preferred)
+        cur = urlparse(url)
+        path = cur.path or ""
+        marker = "/RenderingControl/"
+        if marker in path:
+            path = path[path.find(marker) :]
+        url = urlunparse((pref.scheme or "http", pref.netloc, path, "", "", ""))
+    return url or None
 
 
-async def sm6_rc_action(device, action: str, **fields) -> bool:
-    """Post a RenderingControl action with Cambridge-style SOAP headers."""
+async def _sm6_rc_post(device, action: str, **fields) -> bool:
+    """Post a RenderingControl action (caller holds dispatcher soap lock)."""
     url = await _rendering_control_url(device)
     if not url:
         logger.warning("%s SM6 %s: RenderingControl not found", device.name, action)
@@ -178,37 +191,49 @@ async def sm6_rc_action(device, action: str, **fields) -> bool:
         'Content-Type': 'text/xml; charset="utf-8"',
     }
 
-    async with _lock_for(device):
-        try:
-            async with g.http.post(
-                url,
-                data=body.encode("utf-8"),
-                headers=headers,
-                timeout=settings.http_timeout_dlna,
-            ) as response:
-                text = await response.text()
-                if response.status == 200:
-                    logger.debug(
-                        "%s SM6 %s OK url=%s fields=%s",
-                        device.name,
-                        action,
-                        url,
-                        fields,
-                    )
-                    return True
-                logger.warning(
-                    "%s SM6 %s HTTP %s url=%s fields=%s body=%s",
+    try:
+        async with g.http.post(
+            url,
+            data=body.encode("utf-8"),
+            headers=headers,
+            timeout=settings.http_timeout_dlna,
+        ) as response:
+            text = await response.text()
+            if response.status == 200:
+                logger.debug(
+                    "%s SM6 %s OK url=%s fields=%s",
                     device.name,
                     action,
-                    response.status,
                     url,
                     fields,
-                    (text or "")[:800],
                 )
-                return False
-        except Exception as exc:
-            logger.warning("%s SM6 %s error url=%s: %s", device.name, action, url, exc)
+                return True
+            logger.warning(
+                "%s SM6 %s HTTP %s url=%s fields=%s body=%s",
+                device.name,
+                action,
+                response.status,
+                url,
+                fields,
+                (text or "")[:800],
+            )
             return False
+    except Exception as exc:
+        logger.warning("%s SM6 %s error url=%s: %s", device.name, action, url, exc)
+        return False
+
+
+async def sm6_rc_action(device, action: str, **fields) -> bool:
+    """Post a RenderingControl action with Cambridge-style SOAP headers."""
+    from dlna.sm6_dispatcher import get_sm6_dispatcher
+
+    uuid = _device_uuid(device)
+    dispatcher = get_sm6_dispatcher(uuid, sm6_preferred_description_url(device))
+
+    async def _send() -> bool:
+        return await _sm6_rc_post(device, action, **fields)
+
+    return await dispatcher.submit_control(_send, label=action)
 
 
 async def sm6_set_volume(device, desired: int) -> bool:

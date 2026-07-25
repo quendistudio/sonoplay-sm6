@@ -143,13 +143,16 @@ class Settings(BaseSettings):
     sm6_poll_volume_every_cycles: int = 4
     sm6_poll_mute_every_cycles: int = 4
     sm6_poll_playlist_every_cycles: int = 4
-    sm6_transport_hold_seconds: float = 0.2
+    sm6_soap_backoff_base_seconds: float = 0.5
+    sm6_soap_backoff_max_seconds: float = 30.0
+    sm6_force_poll_debounce_seconds: float = 0.25
+    # Min gap between consecutive dispatcher SOAP jobs (volume/transport/queue/poll).
+    sm6_soap_min_interval_seconds: float = 0.3
     # Minimum threshold (ms) to wake Plex long-poll — never applied to the position value.
-    sm6_position_plex_notify_min_delta_ms: int = 1000
+    sm6_position_plex_notify_min_delta_ms: int = 300
     sm6_position_assume_play_delay_seconds: float = 0.1
     sm6_position_assume_skip_delay_seconds: float = 0.35
-    sm6_position_resync_back_tolerance_ms: int = 500
-    sm6_optimistic_play_seconds: float = 2.5
+    sm6_position_resync_back_tolerance_ms: int = 1000
     sm6_play_timeline_push_interval_seconds: float = 0.25
     sm6_plexamp_volume_step_enabled: bool = True
     sm6_plexamp_volume_step_max_delta: int = 8

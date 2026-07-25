@@ -286,7 +286,7 @@ class DlnaDeviceService(object):
                     # 4xx and other errors still raise immediately
                     if not response.ok:
                         raise Exception(f"service {self.control_url} {action} {response.status} {await response.text()}")
-                    self.device.repeat_error_count = 0
+                    self.device.note_soap_success()
                     
                     # Get response, sanitize for device quirks, parse defensively
                     response_text = await response.text()
@@ -317,13 +317,24 @@ class DlnaDeviceService(object):
                 # All retries exhausted
                 logger.warning("dlna %s %s connection failed after %d attempts: %s",
                               self.device.name, action, MAX_RETRIES, str(e))
-                self.device.repeat_error_count += 1
-                if self.device.repeat_error_count >= ERROR_COUNT_TO_REMOVE:
-                    logger.warning("remove device %s due to %d connection errors", self.device.name, self.device.repeat_error_count)
+                self.device.note_soap_failure()
+                if (
+                    self.device.repeat_error_count >= ERROR_COUNT_TO_REMOVE
+                    and not self.device._remove_scheduled
+                ):
+                    self.device._remove_scheduled = True
+                    logger.warning(
+                        "remove device %s due to %d connection errors",
+                        self.device.name,
+                        self.device.repeat_error_count,
+                    )
                     if asyncio.get_running_loop() == self.device.loop:
                         asyncio.create_task(self.device.remove_self())
                     else:
-                        asyncio.run_coroutine_threadsafe(self.device.remove_self(), self.device.loop)
+                        asyncio.run_coroutine_threadsafe(
+                            self.device.remove_self(),
+                            self.device.loop,
+                        )
                 raise
             except ServerErrorException as e:
                 if attempt < MAX_RETRIES:
@@ -430,6 +441,9 @@ class DlnaDevice(object):
         self.uuid = None
         self.loop = asyncio.get_running_loop()
         self.repeat_error_count = 0
+        self.soap_consecutive_failures = 0
+        self.soap_backoff_until = 0.0
+        self._remove_scheduled = False
 
     async def get_data(self):
         if self.info is None:
@@ -678,26 +692,61 @@ class DlnaDevice(object):
             self.volume_step,
         )
 
+    def note_soap_success(self) -> None:
+        self.soap_consecutive_failures = 0
+        self.soap_backoff_until = 0.0
+        self.repeat_error_count = 0
+
+    def note_soap_failure(self) -> None:
+        import time
+
+        from dlna.soap_backoff import soap_backoff_seconds
+
+        self.soap_consecutive_failures += 1
+        delay = soap_backoff_seconds(
+            self.soap_consecutive_failures,
+            base=settings.sm6_soap_backoff_base_seconds,
+            maximum=settings.sm6_soap_backoff_max_seconds,
+        )
+        self.soap_backoff_until = time.monotonic() + delay
+        self.repeat_error_count += 1
+
+    def soap_backoff_remaining(self) -> float:
+        import time
+
+        return max(0.0, self.soap_backoff_until - time.monotonic())
+
     def volume_range(self):
         from dlna.sm6_volume import VolumeRange
 
         return VolumeRange.from_device(self)
 
     async def remove_self(self):
+        from plex.adapters import get_adapter_if_present, remove_adapter
+        from plex.plexserver import unregister_gdm_for_device
+        from plex.subscribe import sub_man
+
+        self.note_soap_success()
+        self._remove_scheduled = False
+        unregister_gdm_for_device(self.uuid)
+        self.stop_subscribe()
         async with devices_lock:
             if self in devices:
                 devices.remove(self)
-        from plex.adapters import adapter_by_device, remove_adapter
-        from plex.subscribe import sub_man
-        self.stop_subscribe()
-        adapter = await adapter_by_device(self)
-        adapter.state.state = "STOPPED"
-        adapter.state._wakeup_loop()
-        adapter.state._thread_should_stop = True
-        await sub_man.notify_device_disconnected(self)
-        await sub_man.notify_server_device(self, force=True)
-        adapter.queue = None
-        await remove_adapter(adapter)
+        adapter = await get_adapter_if_present(self.uuid)
+        if adapter is not None:
+            if hasattr(adapter, "_sm6_reset_plex_neutral"):
+                await adapter._sm6_reset_plex_neutral("device_offline")
+            adapter.state.state = "STOPPED"
+            adapter.state._thread_should_stop = True
+            adapter.state._wakeup_loop()
+            await sub_man.notify_device_disconnected(self)
+            await sub_man.notify_server_device(self, force=True)
+            adapter.queue = None
+            await remove_adapter(adapter)
+        else:
+            await sub_man.notify_device_disconnected(self)
+            await sub_man.notify_server_device(self, force=True)
         settings.mark_device_status(self.uuid, "offline")
 
     def __str__(self):

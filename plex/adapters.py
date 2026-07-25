@@ -20,7 +20,6 @@
 # (at your option) any later version.
 
 import asyncio
-from contextlib import AsyncExitStack, asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta, datetime, timezone
 import logging
@@ -32,6 +31,13 @@ import weakref
 from typing import TYPE_CHECKING, Optional
 
 logger = logging.getLogger(__name__)
+
+# Non-SM6 skipPrevious: restart track if elapsed exceeds this window.
+_SM6_PREV_SKIP_WINDOW_MS = 5000
+
+
+def _is_play_queue_container(container_key) -> bool:
+    return "/playQueues/" in str(container_key or "")
 
 
 def _virtual_member_uuids(dlna) -> list[str] | None:
@@ -74,6 +80,12 @@ _stats_io_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stats
 def _persist_stats(fn, *args):
     """Run a blocking settings write off the event loop (ordered)."""
     _stats_io_executor.submit(fn, *args)
+
+
+async def get_adapter_if_present(device_uuid: str):
+    """Return a registered adapter without creating one (device teardown paths)."""
+    async with _adapters_lock:
+        return adapters.get(device_uuid)
 
 
 async def adapter_by_device(device, query_params: QueryParams = None):
@@ -271,23 +283,30 @@ class PlexLib(object):
         artist: str | None = None,
         album: str | None = None,
         album_hint: str | None = None,
+        duration_seconds: int | None = None,
     ):
-        """Search the Plex library for a track (SM6 queue sync)."""
+        """Last-resort Plex library lookup — artist required; never title-only."""
         from urllib.parse import quote
 
+        from plex.track_metadata_search import (
+            disambiguate_tracks_by_duration,
+            pick_unique_track,
+        )
+
+        artist_text = str(artist or "").strip()
+        if not artist_text:
+            logger.debug("search_track refused: missing artist for %r", title)
+            return None
+
         title_cf = str(title).casefold()
-        artist_cf = str(artist).casefold() if artist else None
+        artist_cf = artist_text.casefold()
         album_cf = str(album).casefold() if album else None
         hint_cf = str(album_hint).casefold() if album_hint else None
 
         queries: list[str] = []
-        if artist and album:
-            queries.append(f"{title} {artist} {album}")
-        if artist:
-            queries.append(f"{title} {artist}")
         if album:
-            queries.append(f"{title} {album}")
-        queries.append(str(title))
+            queries.append(f"{title} {artist_text} {album}")
+        queries.append(f"{title} {artist_text}")
 
         seen_queries: set[str] = set()
         candidates: list[dict] = []
@@ -313,7 +332,7 @@ class PlexLib(object):
                     continue
                 if str(hit.get("title", "")).casefold() != title_cf:
                     continue
-                if artist_cf and str(hit.get("grandparentTitle", "")).casefold() != artist_cf:
+                if str(hit.get("grandparentTitle", "")).casefold() != artist_cf:
                     continue
                 if album_cf and str(hit.get("parentTitle", "")).casefold() != album_cf:
                     continue
@@ -322,48 +341,57 @@ class PlexLib(object):
                     seen_keys.add(rk)
                     candidates.append(hit)
 
-            if candidates and (artist_cf or album_cf):
+            if candidates:
                 break
 
-        if not candidates:
-            if artist and album:
-                return await self._find_track_on_album(title, artist, album)
-            return None
-        if len(candidates) == 1:
-            return DotMap(candidates[0])
+        if not candidates and album:
+            return await self._find_track_on_album(
+                title,
+                artist_text,
+                album,
+                duration_seconds=duration_seconds,
+            )
 
         if hint_cf:
-            hinted = [
-                h for h in candidates
-                if str(h.get("parentTitle", "")).casefold() == hint_cf
-            ]
-            if len(hinted) == 1:
-                return DotMap(hinted[0])
+            candidates = [
+                hit for hit in candidates
+                if str(hit.get("parentTitle", "")).casefold() == hint_cf
+            ] or candidates
 
-        filtered = candidates
-        if artist_cf:
-            filtered = [
-                h for h in filtered
-                if str(h.get("grandparentTitle", "")).casefold() == artist_cf
-            ]
-        if album_cf:
-            filtered = [
-                h for h in filtered
-                if str(h.get("parentTitle", "")).casefold() == album_cf
-            ]
-        if len(filtered) == 1:
-            return DotMap(filtered[0])
-
-        # ponytail: titre seul + homonymes → pas de devinette
-        if not artist_cf and not album_cf:
-            return None
-        if artist and album:
-            return await self._find_track_on_album(title, artist, album)
+        candidates = disambiguate_tracks_by_duration(
+            candidates,
+            duration_seconds=duration_seconds,
+        )
+        unique = pick_unique_track(
+            candidates,
+            label=f"{title!r} / {artist_text!r}",
+        )
+        if unique is not None:
+            return DotMap(unique)
+        if album:
+            return await self._find_track_on_album(
+                title,
+                artist_text,
+                album,
+                duration_seconds=duration_seconds,
+            )
         return None
 
-    async def _find_track_on_album(self, title: str, artist: str, album: str):
-        """Resolve a track by listing album children (short titles like « yes »)."""
+    async def _find_track_on_album(
+        self,
+        title: str,
+        artist: str,
+        album: str,
+        *,
+        duration_seconds: int | None = None,
+    ):
+        """Resolve a track by listing album children (requires artist + album)."""
         from urllib.parse import quote
+
+        from plex.track_metadata_search import (
+            disambiguate_tracks_by_duration,
+            pick_unique_track,
+        )
 
         title_cf = str(title).casefold()
         artist_cf = str(artist).casefold()
@@ -394,10 +422,19 @@ class PlexLib(object):
         async with g.http.get(url, headers=self.request_headers(accept_json=True)) as res:
             res.raise_for_status()
             payload = await res.json()
-        for hit in (payload.get("MediaContainer") or {}).get("Metadata") or []:
-            if str(hit.get("title", "")).casefold() == title_cf:
-                return DotMap(hit)
-        return None
+        matches = [
+            DotMap(hit)
+            for hit in (payload.get("MediaContainer") or {}).get("Metadata") or []
+            if str(hit.get("title", "")).casefold() == title_cf
+        ]
+        matches = disambiguate_tracks_by_duration(
+            matches,
+            duration_seconds=duration_seconds,
+        )
+        return pick_unique_track(
+            matches,
+            label=f"{title!r} / {artist!r} / {album!r}",
+        )
 
 
 class DlnaState(object):
@@ -420,6 +457,7 @@ class DlnaState(object):
         self._changed_state = None
         self.change_session_lock = None
         self._check_all_next_loop = False
+        self._last_force_poll_wake_mono = 0.0
         self.looping_wait_event: asyncio.Event = None
         self.last_access_time = datetime.now(timezone.utc)
         self._elapsed_anchor_ms: int | None = None
@@ -500,10 +538,18 @@ class DlnaState(object):
 
     @check_all_next_loop.setter
     def check_all_next_loop(self, value: bool):
-        if self._check_all_next_loop == value:
+        if not value:
+            self._check_all_next_loop = False
             return
-        self._check_all_next_loop = value
-        if value:
+        if self._check_all_next_loop:
+            return
+        self._check_all_next_loop = True
+        from settings import settings
+
+        now = time.monotonic()
+        debounce = settings.sm6_force_poll_debounce_seconds
+        if now - self._last_force_poll_wake_mono >= debounce:
+            self._last_force_poll_wake_mono = now
             self._wakeup_loop()
 
     def __setattr__(self, key, value):
@@ -658,8 +704,9 @@ class DlnaState(object):
         return target
 
     def live_elapsed_ms(self) -> int:
-        """Current position: extrapolated while playing, otherwise stored value."""
-        if self._elapsed_assume_active and self.state == "PLAYING":
+        """Current position: extrapolated while assume is armed (Plex-side clock)."""
+        # ponytail: gated on assume, not SM6 PLAYING — timeline starts at Plex play/skip.
+        if self._elapsed_assume_active:
             computed = self._computed_elapsed_from_anchor()
             if computed is not None:
                 return computed
@@ -669,9 +716,7 @@ class DlnaState(object):
         """1:1 ms extrapolation; wake Plex on ms delta without quantizing position."""
         if not self._elapsed_assume_active:
             return
-        if self.state != "PLAYING":
-            self._disarm_elapsed_assume_impl()
-            return
+        # Pause/stop/detach callers disarm explicitly — do not infer from transport here.
         target = self._computed_elapsed_from_anchor()
         if target is None:
             self._sync_elapsed_anchor(self._elapsed)
@@ -681,10 +726,6 @@ class DlnaState(object):
         if target == self._elapsed or (delta >= 0 and delta < min_delta):
             return
         self.elapsed = target
-
-    def _apply_assumed_elapsed_tick(self) -> None:
-        """Alias kept for existing tests and callers."""
-        self._refresh_assumed_elapsed()
 
     def __del__(self):
         # Only flag the thread to stop — joining here can block the GC.
@@ -728,9 +769,6 @@ class DlnaState(object):
 
     async def check(self, client: aiohttp.ClientSession, check_count=0):
         sm6_renderer = hasattr(self, "adapter") and self.adapter._is_sm6_renderer()
-        if sm6_renderer and hasattr(self.adapter, "_sm6_any_poll_paused_sync"):
-            if self.adapter._sm6_any_poll_paused_sync():
-                return
 
         position_check_count = 1
         if sm6_renderer:
@@ -754,6 +792,15 @@ class DlnaState(object):
             if await self.adapter._sm6_should_skip_volume_poll():
                 poll_volume = False
         poll_muted = check_count % muted_check_count == 0 or self.check_all_next_loop
+        # Poll source until clients are detached — not gated on relinquished.
+        # device_stopped/plex_stop often fires before the next %10 cycle; gating on
+        # relinquished skipped detach entirely (Plexamp path / STOP-on-source-change).
+        poll_audio_source = (
+            sm6_renderer
+            and hasattr(self.adapter, "_sm6_note_polled_audio_source")
+            and (check_count % 10 == 0 or self.check_all_next_loop)
+            and not getattr(self.adapter, "_sm6_plex_clients_detached", False)
+        )
         force_poll = self.check_all_next_loop
         if self.check_all_next_loop:
             self.check_all_next_loop = False
@@ -762,28 +809,117 @@ class DlnaState(object):
         position_info = None
         volume_info = None
         muted_info = None
-        parallel: list = []
-        if poll_transport:
-            parallel.append(("transport", self.dlna.GetTransportInfo(client=client)))
-        if poll_volume:
-            parallel.append(("volume", self.dlna.GetVolume(client=client)))
-        if poll_muted:
-            parallel.append(("mute", self.dlna.GetMute(client=client)))
-
-        if parallel:
-            results = await asyncio.gather(*(coro for _, coro in parallel), return_exceptions=True)
-            for (label, _), result in zip(parallel, results):
-                if isinstance(result, BaseException):
+        detach_audio_source = None
+        if sm6_renderer:
+            need_position = poll_position_cycle and (
+                self.state in _ACTIVE_TRANSPORT_STATES
+                or self.state == "TRANSITIONING"
+                or poll_transport
+            )
+            if poll_transport or poll_volume or poll_muted or need_position or poll_audio_source:
+                try:
+                    batch = await self.adapter._sm6_state_poll_soap(
+                        poll_transport=poll_transport,
+                        poll_volume=poll_volume,
+                        poll_muted=poll_muted,
+                        poll_position=need_position,
+                        poll_audio_source=poll_audio_source,
+                    )
+                except Exception as exc:
                     if __debug__:
-                        logger.debug("dlna %s state loop %s error: %s", self.dlna.name, label, result)
-                    continue
-                if label == "transport":
-                    transport_info = result
-                elif label == "volume":
-                    volume_info = result
-                elif label == "mute":
-                    muted_info = result
+                        logger.debug("dlna %s SM6 state poll failed: %s", self.dlna.name, exc)
+                    batch = {}
+                transport_info = batch.get("transport")
+                volume_info = batch.get("volume")
+                muted_info = batch.get("mute")
+                position_info = batch.get("position")
+                detach_audio_source = batch.get("detach_audio_source")
+        else:
+            parallel: list = []
+            if poll_transport:
+                parallel.append(("transport", self.dlna.GetTransportInfo(client=client)))
+            if poll_volume:
+                parallel.append(("volume", self.dlna.GetVolume(client=client)))
+            if poll_muted:
+                parallel.append(("mute", self.dlna.GetMute(client=client)))
+            if poll_position_cycle and self.state in _ACTIVE_TRANSPORT_STATES:
+                parallel.append(("position", self.dlna.GetPositionInfo(client=client)))
 
+            if parallel:
+                results = await asyncio.gather(*(coro for _, coro in parallel), return_exceptions=True)
+                for (label, _), result in zip(parallel, results):
+                    if isinstance(result, BaseException):
+                        if __debug__:
+                            logger.debug("dlna %s state loop %s error: %s", self.dlna.name, label, result)
+                        continue
+                    if label == "transport":
+                        transport_info = result
+                    elif label == "volume":
+                        volume_info = result
+                    elif label == "mute":
+                        muted_info = result
+                    elif label == "position":
+                        position_info = result
+
+        volume_plex = None
+        if volume_info is not None:
+            volume_value = extract_value(getattr(volume_info, "CurrentVolume", None))
+            if sm6_renderer:
+                from dlna.sm6_volume import dlna_level_to_plex
+
+                volume_range = await self.adapter._sm6_volume_range()
+                volume_plex = dlna_level_to_plex(volume_value, volume_range)
+                logger.debug(
+                    "%s GetVolume raw=%r range=%s..%s -> plex=%s%%",
+                    self.dlna.name,
+                    volume_value,
+                    volume_range.minimum,
+                    volume_range.maximum,
+                    volume_plex,
+                )
+            else:
+                try:
+                    volume_value = int(volume_value)
+                except (TypeError, ValueError):
+                    volume_value = self.dlna.volume_min
+                volume_plex = convert_volume(
+                    volume_value, self.dlna.volume_max, self.dlna.volume_min, 100, 0, 1
+                )
+
+        muted_value = None
+        if muted_info is not None:
+            muted_value = extract_value(getattr(muted_info, "CurrentMute", None))
+            if isinstance(muted_value, str):
+                muted_value = muted_value.lower() in ("1", "true", "yes")
+            muted_value = bool(muted_value)
+
+        async with self.change_session_lock:
+            self._apply_check_results(
+                check_count=check_count,
+                force_poll=force_poll,
+                poll_position_cycle=poll_position_cycle,
+                sm6_renderer=sm6_renderer,
+                transport_info=transport_info,
+                position_info=position_info,
+                volume_plex=volume_plex,
+                muted_value=muted_value,
+                detach_audio_source=detach_audio_source,
+            )
+
+    def _apply_check_results(
+        self,
+        *,
+        check_count: int,
+        force_poll: bool,
+        poll_position_cycle: bool,
+        sm6_renderer: bool,
+        transport_info,
+        position_info,
+        volume_plex: int | None,
+        muted_value: bool | None,
+        detach_audio_source,
+    ) -> None:
+        """Apply polled SOAP results under change_session_lock (no I/O here)."""
         self.begin_change_session()
 
         if transport_info is not None:
@@ -803,6 +939,7 @@ class DlnaState(object):
                 sync_playlist = (
                     sm6_renderer
                     and hasattr(self.adapter, "_sm6_maybe_sync_playlist")
+                    and not getattr(self.adapter, "_sm6_plex_clients_detached", False)
                     and (
                         force_poll
                         or check_count % max(1, settings.sm6_poll_playlist_every_cycles) == 0
@@ -813,12 +950,6 @@ class DlnaState(object):
                         self.adapter._sm6_maybe_sync_playlist(),
                         self.adapter.loop,
                     )
-                try:
-                    position_info = await self.dlna.GetPositionInfo(client=client)
-                except Exception as exc:
-                    if __debug__:
-                        logger.debug("dlna %s GetPositionInfo error: %s", self.dlna.name, exc)
-                    position_info = None
                 if position_info is not None:
                     previous_uri = self.current_uri
                     new_elapsed = int(parse_timedelta(position_info.RelTime).total_seconds() * 1000)
@@ -836,6 +967,7 @@ class DlnaState(object):
                         track_uri
                         and track_uri != previous_uri
                         and hasattr(self.adapter, "_sm6_sync_from_polled_uri")
+                        and not getattr(self.adapter, "_sm6_plex_clients_detached", False)
                     ):
                         asyncio.run_coroutine_threadsafe(
                             self.adapter._sm6_sync_from_polled_uri(track_uri),
@@ -857,54 +989,29 @@ class DlnaState(object):
                 if sm6_renderer:
                     self._disarm_elapsed_assume_impl()
 
-        if sm6_renderer:
-            if (
-                hasattr(self.adapter, "_sm6_poll_audio_source")
-                and check_count % 10 == 0
-            ):
-                asyncio.run_coroutine_threadsafe(
-                    self.adapter._sm6_poll_audio_source(),
-                    self.adapter.loop,
-                )
-            if self.state == "PLAYING":
-                if not poll_position_cycle or position_info is None:
-                    self._refresh_assumed_elapsed()
-            elif self.state != "PLAYING":
-                self._disarm_elapsed_assume_impl()
+        if sm6_renderer and self._elapsed_assume_active:
+            # RelTime realigns the anchor; extrapolation keeps ticking between polls.
+            self._refresh_assumed_elapsed()
 
-        if volume_info is not None:
-            volume_value = extract_value(getattr(volume_info, 'CurrentVolume', None))
-            if hasattr(self, "adapter") and self.adapter._is_sm6_renderer():
-                from dlna.sm6_volume import dlna_level_to_plex
-
-                volume_range = await self.adapter._sm6_volume_range()
-                plex_vol = dlna_level_to_plex(volume_value, volume_range)
-                logger.debug(
-                    "%s GetVolume raw=%r range=%s..%s -> plex=%s%%",
-                    self.dlna.name,
-                    volume_value,
-                    volume_range.minimum,
-                    volume_range.maximum,
-                    plex_vol,
-                )
-                self.volume = plex_vol
-            else:
-                try:
-                    volume_value = int(volume_value)
-                except (TypeError, ValueError):
-                    volume_value = self.dlna.volume_min
-                self.volume = convert_volume(
-                    volume_value, self.dlna.volume_max, self.dlna.volume_min, 100, 0, 1
-                )
-        if muted_info is not None:
-            muted_value = extract_value(getattr(muted_info, 'CurrentMute', None))
-            if isinstance(muted_value, str):
-                muted_value = muted_value.lower() in ("1", "true", "yes")
-            self.muted = bool(muted_value)
+        if volume_plex is not None:
+            self.volume = volume_plex
+        if muted_value is not None:
+            self.muted = muted_value
 
         changed_state = self.end_change_session()
         if changed_state and self.state_change_callback:
             self.state_change_callback(changed_state)
+
+        if (
+            detach_audio_source is not None
+            and hasattr(self.adapter, "_sm6_detach_plex_for_external_source")
+            and self.adapter.loop is not None
+            and not self.adapter.loop.is_closed()
+        ):
+            asyncio.run_coroutine_threadsafe(
+                self.adapter._sm6_detach_plex_for_external_source(detach_audio_source),
+                self.adapter.loop,
+            )
 
     @property
     def loop_interval(self):
@@ -939,8 +1046,13 @@ class DlnaState(object):
             check_count = 0
             one_batch_count = 500
             while not self._thread_should_stop:
-                async with self.change_session_lock:
-                    await self.check(client, check_count=check_count)
+                backoff = self.dlna.soap_backoff_remaining()
+                if backoff > 0:
+                    await asyncio.sleep(backoff)
+                    continue
+                # SOAP I/O must not hold change_session_lock — multilane poll can
+                # wait behind queue jobs; arm/update need to apply in the meantime.
+                await self.check(client, check_count=check_count)
                 check_count += 1
                 if check_count > one_batch_count:
                     check_count = 0
@@ -1038,17 +1150,23 @@ class PlexDlnaAdapter(object):
         self._sm6_volume_timeline_task: Optional[asyncio.Task] = None
         self._sm6_play_notify_task: Optional[asyncio.Task] = None
         self._sm6_transcode_prefetch_task: Optional[asyncio.Task] = None
+        self._sm6_tail_fill_task: Optional[asyncio.Task] = None
         self._sm6_enqueued_tracks: tuple = ()
+        self._sm6_track_rating_keys: dict[int, str] = {}
         self._sm6_synced_tail_item_ids: tuple[int, ...] = ()
-        self._sm6_optimistic_play_until: float | None = None
         self._sm6_outbound_until: float | None = None
         self._sm6_volume_grace_until: float | None = None
         self._sm6_relinquished_control = False
         self._sm6_sonoplay_owned_playback = False
         self._sm6_plex_play_in_progress = False
+        # Bumped by each playMedia so a stale finally cannot abort a newer play.
+        self._sm6_plex_play_epoch = 0
+        # Latch so /player/timeline/poll returns disconnected="1" (push-only notify is not enough).
+        self._sm6_plex_clients_detached = False
         self._sm6_last_plex_playlist_fingerprint: tuple | None = None
         self._sm6_playlist_rebuild_backoff_until: float = 0.0
         self._sm6_last_audio_source: int | None = None
+        self._sm6_last_skip_previous_mono: float | None = None
         stored_stats = settings.get_device_stats(self.dlna.uuid)
         self.stats_play_count = stored_stats.get('play_count', 0)
         self.stats_play_duration_ms = stored_stats.get('play_duration_ms', 0)
@@ -1079,169 +1197,77 @@ class PlexDlnaAdapter(object):
         self._seen_playing_since_operation = False
         self._operation_start_time: Optional[float] = None
 
+    def _sm6_clear_plex_session_local(self) -> None:
+        self.queue = None
+        self.current_track_info = None
+        self._sm6_session_uri = None
+        self._sm6_enqueued_tracks = ()
+        self._sm6_track_rating_keys = {}
+        self._sm6_synced_tail_item_ids = ()
+        self._sm6_last_plex_playlist_fingerprint = None
+        self._sm6_last_queue_track_id = None
+        self._sm6_playlist_snapshot = None
+        self._sm6_queue_base_offset = 0
+        self._sm6_sonoplay_owned_playback = False
+        self._sm6_plex_play_in_progress = False
+        self._sm6_playlist_rebuild_backoff_until = 0.0
+        self._sm6_last_skip_previous_mono = None
+
+    def _sm6_schedule_plex_neutral(self, reason: str) -> None:
+        if self.loop is not None and not self.loop.is_closed():
+            asyncio.run_coroutine_threadsafe(
+                self._sm6_reset_plex_neutral(reason),
+                self.loop,
+            )
+            return
+        logger.warning(
+            "%s SM6 Plex neutral (%s): no event loop — local session only",
+            self.dlna.name,
+            reason,
+        )
+        self._sm6_clear_plex_session_local()
+        self.state.update(state="STOPPED", uri=None)
+        self.state.check_all_next_loop = True
+
+    async def _sm6_reset_plex_neutral(self, reason: str) -> None:
+        """Clear Plex playQueue on the server and drop the proxy session."""
+        from plex.play_queue import PlayQueue
+
+        logger.info("%s SM6 Plex session neutral (%s)", self.dlna.name, reason)
+        queue = self.queue
+        play_queue_id = None
+        if queue is not None:
+            if getattr(queue, "info", None) is not None and getattr(
+                queue.info, "playQueueID", None
+            ) is not None:
+                play_queue_id = int(queue.info.playQueueID)
+            else:
+                play_queue_id = PlayQueue.play_queue_id_from_container(queue.container_key)
+        if play_queue_id is not None and await self._ensure_plex_lib_for_sm6_api():
+            await PlayQueue.clear_server_play_queue(self.plex_lib, play_queue_id)
+        self._sm6_clear_plex_session_local()
+        self.state.update(state="STOPPED", uri=None)
+        self.state.check_all_next_loop = True
+        self._sm6_wake_waiters()
+        self._sm6_notify_plex_timeline_sync()
+
     async def _sm6_sync_on_connect(self) -> None:
-        """Sync Plex state on first contact without an SM6 hardware command."""
+        """On DLNA reconnect: neutral Plex session (no queue rebuild from SM6)."""
         from plex.device_profiles import needs_plex_dlna_stream_url
         try:
             await self.dlna.get_data()
             if not needs_plex_dlna_stream_url(self.dlna):
                 return
-            logger.info("%s SM6 connect — passive sync (read-only)", self.dlna.name)
             from dlna.sm6_control import Sm6Control
 
             sm6 = Sm6Control(self.dlna.location_url)
-            await sm6.ensure_power_on()
+            power = await sm6.get_power_state()
+            if power in {"OFF", "IDLE"}:
+                await self._sm6_reset_plex_neutral(f"power_{power.lower()}")
+                return
             await self._sm6_refresh_volume_from_device()
-            transport = await self.dlna.GetTransportInfo()
-            transport_state = getattr(transport, "CurrentTransportState", None)
-            if transport_state in _ACTIVE_TRANSPORT_STATES:
-                self._sm6_sonoplay_owned_playback = False
-                await self._sm6_hydrate_playback_on_connect()
-            else:
-                self.state.update(state="STOPPED", uri=None)
-                self._sm6_session_uri = None
         except Exception as exc:
             logger.warning("%s SM6 connect sync failed: %s", self.dlna.name, exc)
-
-    async def _sm6_hydrate_playback_on_connect(self) -> None:
-        """If the SM6 is already playing, expose track, queue, and position to Plex on connect."""
-        try:
-            transport = await self.dlna.GetTransportInfo()
-            transport_state = getattr(transport, "CurrentTransportState", None)
-            if transport_state not in _ACTIVE_TRANSPORT_STATES:
-                return
-            from dlna.sm6_control import Sm6Control
-
-            sm6 = Sm6Control(self.dlna.location_url)
-            playlist_state = await sm6.read_playlist_state(fetch_tracks=True)
-            self._sm6_playlist_snapshot = playlist_state
-            self._sm6_last_queue_track_id = playlist_state.current_track_id
-
-            position = await self.dlna.GetPositionInfo()
-            rel_time = extract_value(getattr(position, "RelTime", None), "0")
-            uri = extract_value(getattr(position, "TrackURI", None), "")
-
-            self._sm6_sonoplay_owned_playback = False
-            if uri and self._sm6_uri_is_plex_resolvable(uri):
-                if await self._ensure_plex_lib_for_sm6_api():
-                    await self._sm6_sync_from_polled_uri(uri)
-                if self.current_track_info or await self._sm6_is_playlist_queue_coherent(
-                    playlist_state
-                ):
-                    if not self.current_track_info:
-                        await self._sm6_apply_queue_track(
-                            playlist_state.current_track_id,
-                            queue_index=playlist_state.media_queue_index,
-                        )
-                    self.state.update(
-                        state=transport_state,
-                        uri=self._sm6_session_uri or uri,
-                        position=rel_time,
-                    )
-                    self._sm6_wake_waiters()
-                    return
-
-            if await self._sm6_is_playlist_queue_coherent(playlist_state):
-                await self._sm6_apply_queue_track(
-                    playlist_state.current_track_id,
-                    queue_index=playlist_state.media_queue_index,
-                )
-                self.state.update(
-                    state=transport_state,
-                    uri=self._sm6_session_uri or uri,
-                    position=rel_time,
-                )
-                self._sm6_wake_waiters()
-                return
-
-            if await self._sm6_rebuild_plex_playlist_from_sm6(force=True):
-                self.state.update(
-                    state=transport_state,
-                    uri=self._sm6_session_uri or uri,
-                    position=rel_time,
-                )
-                self._sm6_wake_waiters()
-                return
-
-            if playlist_state.length > 0 and playlist_state.current_track_id >= 0:
-                entry = self._sm6_entry_for_track_id(
-                    playlist_state.current_track_id,
-                    playlist_state=playlist_state,
-                )
-                if entry is not None:
-                    track = await self._sm6_resolve_entry_to_track(
-                        entry,
-                        queue_index=playlist_state.media_queue_index,
-                    )
-                    if track is not None:
-                        if self.queue is not None and playlist_state.media_queue_index >= 0:
-                            selected = await self.queue.selected_offset()
-                            self._sm6_queue_base_offset = max(
-                                0, selected - playlist_state.media_queue_index
-                            )
-                        self.current_track_info = track
-                        from plex.url_resolver import get_url_resolver
-                        try:
-                            self._sm6_session_uri = await get_url_resolver().resolve_stream_url(track)
-                        except LookupError:
-                            self._sm6_session_uri = uri or None
-                        self.state.update(
-                            state=transport_state,
-                            uri=self._sm6_session_uri or uri,
-                            position=rel_time,
-                        )
-                        logger.info(
-                            "%s SM6 hydrate connect (playlist): %s (ratingKey=%s, track_id=%s, index=%s) @ %s",
-                            self.dlna.name,
-                            getattr(track, "title", "?"),
-                            getattr(track, "ratingKey", "?"),
-                            playlist_state.current_track_id,
-                            playlist_state.media_queue_index,
-                            rel_time,
-                        )
-                        self._sm6_sonoplay_owned_playback = False
-                        self._sm6_wake_waiters()
-                        return
-
-            if not uri:
-                return
-            if not self._sm6_uri_is_plex_resolvable(uri):
-                logger.info(
-                    "%s SM6 playing but URI not Plex/DLNA resolvable: %s",
-                    self.dlna.name,
-                    uri,
-                )
-                return
-            from plex.url_resolver import get_url_resolver
-            rating_key = get_url_resolver().rating_key_for_stream_url(uri)
-            if not rating_key:
-                logger.info(
-                    "%s SM6 playing but URI %s not resolved (DLNA cache)",
-                    self.dlna.name,
-                    uri,
-                )
-                return
-            metadata = await self.plex_lib.fetch_metadata(f"/library/metadata/{rating_key}")
-            if metadata is None:
-                return
-            self.current_track_info = metadata
-            self._sm6_session_uri = uri
-            self.state.update(
-                state=transport_state,
-                uri=uri,
-                position=rel_time,
-            )
-            logger.info(
-                "%s SM6 hydrate connect (uri): %s (ratingKey=%s) @ %s",
-                self.dlna.name,
-                getattr(metadata, "title", "?"),
-                rating_key,
-                rel_time,
-            )
-            self._sm6_sonoplay_owned_playback = False
-            self._sm6_wake_waiters()
-        except Exception as exc:
-            logger.debug("%s SM6 hydrate on connect failed: %s", self.dlna.name, exc)
 
     async def _with_no_notice(self, coro):
         """Wrap a coroutine so no_notice is True while it runs on the main loop."""
@@ -1517,11 +1543,6 @@ class PlexDlnaAdapter(object):
         uuid = getattr(self.dlna, "uuid", None)
         return [uuid] if uuid else []
 
-    def _sm6_any_poll_paused_sync(self) -> bool:
-        from dlna.sm6_soap_lane import poll_should_pause
-
-        return any(poll_should_pause(uuid) for uuid in self._sm6_poll_uuids_sync())
-
     async def _sm6_send_key(self, key: str) -> None:
         from dlna.sm6_control import sm6_transport_key_pressed
 
@@ -1531,14 +1552,184 @@ class PlexDlnaAdapter(object):
         for device in devices:
             await sm6_transport_key_pressed(device, key)
 
-    @asynccontextmanager
-    async def _sm6_transport_lane(self):
-        from dlna.sm6_soap_lane import sm6_transport_command
+    def _sm6_dispatcher(self):
+        from dlna.sm6_dispatcher import get_sm6_dispatcher
 
-        async with AsyncExitStack() as stack:
-            for uuid in self._sm6_poll_uuids_sync():
-                await stack.enter_async_context(sm6_transport_command(uuid))
-            yield
+        return get_sm6_dispatcher(str(self.dlna.uuid), self.dlna.location_url)
+
+    def _sm6_control(self):
+        from dlna.sm6_control import Sm6Control
+
+        return Sm6Control(self.dlna.location_url)
+
+    async def _sm6_run_transport(
+        self,
+        fn,
+        *,
+        label: str,
+        preempts_queue: bool = True,
+        wait: bool = True,
+    ):
+        return await self._sm6_dispatcher().submit_transport(
+            fn,
+            label=label,
+            preempts_queue=preempts_queue,
+            wait=wait,
+        )
+
+    async def _sm6_run_control(
+        self,
+        fn,
+        *,
+        label: str,
+        preempts_queue: bool = False,
+        wait: bool = True,
+    ):
+        """Control lane (volume/mute/stop/play/pause/skip) — no queue preempt by default."""
+        return await self._sm6_dispatcher().submit_control(
+            fn,
+            label=label,
+            preempts_queue=preempts_queue,
+            wait=wait,
+        )
+
+    async def _sm6_run_queue(
+        self,
+        fn,
+        *,
+        label: str,
+        coalesce_key: str | None = None,
+        wait: bool = True,
+    ):
+        return await self._sm6_dispatcher().submit_queue(
+            fn,
+            label=label,
+            coalesce_key=coalesce_key,
+            wait=wait,
+        )
+
+    async def _sm6_run_read(self, fn, *, label: str = "read"):
+        return await self._sm6_dispatcher().submit_poll(fn, label=label)
+
+    async def _sm6_await_on_adapter_loop(self, coro):
+        """Run coro on the adapter event loop (state loop may be another thread)."""
+        loop = self.loop
+        if loop is None or loop.is_closed():
+            return await coro
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            return await coro
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
+        return await asyncio.wrap_future(future)
+
+    def _sm6_note_polled_audio_source(self, current: int | None) -> int | None:
+        """Cache audio source; bump+latch inside poll job when leaving Media Player.
+
+        Returns the source id to detach Plex for, or None.
+        """
+        from dlna.sm6_sources import AUDIO_SOURCE_MEDIA_PLAYER
+        from plex.sm6_session_rules import sm6_should_detach_on_audio_source
+
+        # After device_stopped/plex_stop we are relinquished but may not have
+        # latched detach yet — still detect leaving Media Player.
+        if self._sm6_plex_clients_detached:
+            if current is not None:
+                self._sm6_last_audio_source = current
+            return None
+        previous = self._sm6_last_audio_source
+        if current is not None:
+            self._sm6_last_audio_source = current
+        if not sm6_should_detach_on_audio_source(
+            previous,
+            current,
+            media_player_id=AUDIO_SOURCE_MEDIA_PLAYER,
+            sonoplay_owned=self._sm6_sonoplay_owned_playback,
+        ):
+            return None
+        # Same cancel+bump as plex_stop relinquish (sm6.133) — detach often wins
+        # the race before device_stopped can call _sm6_relinquish_control.
+        self._sm6_abort_queue_work()
+        self._sm6_sonoplay_owned_playback = False
+        self._sm6_relinquished_control = True
+        self._sm6_plex_clients_detached = True
+        self._suppress_auto_next = True
+        self._sm6_plex_play_in_progress = False
+        self._sm6_clear_optimistic_play()
+        self._sm6_outbound_until = None
+        # Wake long-poll clients before STOPPED races them onto TIMELINE_STOPPED.
+        for entry in list(self.wait_state_change_events):
+            entry["event"].set()
+        logger.info(
+            "%s SM6 audio source %s -> %s — detaching Plex (generation bump)",
+            self.dlna.name,
+            previous,
+            current,
+        )
+        return int(current)
+
+    async def _sm6_state_poll_soap(
+        self,
+        *,
+        poll_transport: bool,
+        poll_volume: bool,
+        poll_muted: bool,
+        poll_position: bool,
+        poll_audio_source: bool = False,
+    ) -> dict:
+        """Batch state-loop GETs through the dispatcher poll lane."""
+        dlna = self.dlna
+
+        async def _batch() -> dict:
+            out: dict = {
+                "transport": None,
+                "volume": None,
+                "mute": None,
+                "position": None,
+                "audio_source": None,
+                "detach_audio_source": None,
+            }
+            if poll_transport:
+                try:
+                    out["transport"] = await dlna.GetTransportInfo()
+                except Exception as exc:
+                    if __debug__:
+                        logger.debug("dlna %s state poll transport: %s", dlna.name, exc)
+            if poll_volume:
+                try:
+                    out["volume"] = await dlna.GetVolume()
+                except Exception as exc:
+                    if __debug__:
+                        logger.debug("dlna %s state poll volume: %s", dlna.name, exc)
+            if poll_muted:
+                try:
+                    out["mute"] = await dlna.GetMute()
+                except Exception as exc:
+                    if __debug__:
+                        logger.debug("dlna %s state poll mute: %s", dlna.name, exc)
+            if poll_position:
+                try:
+                    out["position"] = await dlna.GetPositionInfo()
+                except Exception as exc:
+                    if __debug__:
+                        logger.debug("dlna %s state poll position: %s", dlna.name, exc)
+            if poll_audio_source and not self._sm6_plex_clients_detached:
+                try:
+                    from dlna.sm6_control import Sm6Control
+
+                    current = await Sm6Control(dlna.location_url).get_current_audio_source_id()
+                    out["audio_source"] = current
+                    out["detach_audio_source"] = self._sm6_note_polled_audio_source(current)
+                except Exception as exc:
+                    logger.info("%s SM6 audio source poll failed: %s", dlna.name, exc)
+            return out
+
+        async def _submit():
+            return await self._sm6_dispatcher().submit_poll(_batch, label="state-poll")
+
+        return await self._sm6_await_on_adapter_loop(_submit())
 
     async def _sm6_volume_range(self):
         """Cached UPnP volume range from the physical SM6 target."""
@@ -1554,7 +1745,10 @@ class PlexDlnaAdapter(object):
         if not self._is_sm6_renderer():
             return None
         try:
-            volume = await self.dlna.GetVolume()
+            async def _get():
+                return await self.dlna.GetVolume()
+
+            volume = await self._sm6_run_read(_get, label="GetVolume")
         except Exception as exc:
             logger.debug("%s SM6 GetVolume failed: %s", self.dlna.name, exc)
             return None
@@ -1671,6 +1865,8 @@ class PlexDlnaAdapter(object):
         """Align the Plex queue with the track actually playing on the SM6."""
         if not self._is_sm6_renderer() or not uri:
             return
+        if self._sm6_plex_clients_detached:
+            return
         if self._sm6_relinquished_control and not self._sm6_on_media_player_source():
             return
         if not await self._ensure_plex_lib_for_sm6_api():
@@ -1708,20 +1904,30 @@ class PlexDlnaAdapter(object):
         """True while Plex playMedia owns the adapter — passive SM6 sync must yield."""
         return self._sm6_plex_play_in_progress or self._sm6_sonoplay_owned_playback
 
-    def _sm6_begin_plex_play(self) -> None:
-        """Plex client requested playback — reclaim SM6 control from passive/external sync."""
+    def _sm6_begin_plex_play(self) -> int:
+        """Plex client requested playback — reclaim SM6 control from passive/external sync.
+
+        Returns a play epoch; play_media finally must ignore stale epochs so a
+        superseded request cannot clear queue / abort a newer playMedia.
+        """
         takeover = not self._sm6_sonoplay_owned_playback or self._sm6_relinquished_control
         self._sm6_relinquished_control = False
+        self._sm6_plex_clients_detached = False
         self._sm6_sonoplay_owned_playback = True
         self._suppress_auto_next = False
         self._sm6_last_plex_playlist_fingerprint = None
+        self._sm6_plex_play_epoch += 1
         self._sm6_plex_play_in_progress = True
         self.state.update(state="TRANSITIONING")
+        # Timeline clock starts on Plex play intent (not on SM6 PLAYING confirmation).
+        self._sm6_begin_optimistic_play(elapsed_ms=0)
         logger.info(
-            "%s SM6 Plex play — reclaiming control (takeover=%s)",
+            "%s SM6 Plex play — reclaiming control (takeover=%s epoch=%s)",
             self.dlna.name,
             takeover,
+            self._sm6_plex_play_epoch,
         )
+        return self._sm6_plex_play_epoch
 
     def _sm6_abort_plex_play_takeover(self) -> None:
         """Restore passive SM6 sync after a failed or timed-out Plex playMedia."""
@@ -1743,6 +1949,7 @@ class PlexDlnaAdapter(object):
     def _sm6_mark_playback_owned(self) -> None:
         self._sm6_sonoplay_owned_playback = True
         self._sm6_relinquished_control = False
+        self._sm6_plex_clients_detached = False
         self._sm6_last_plex_playlist_fingerprint = None
 
     def _sm6_publish_track_change(self, track, *, uri: str | None = None) -> None:
@@ -1772,21 +1979,25 @@ class PlexDlnaAdapter(object):
         )
 
     def _sm6_should_accept_transport_state(self, polled: str, current: str | None) -> str:
+        from plex.sm6_session_rules import accept_sm6_polled_transport_state
+
+        accepted = accept_sm6_polled_transport_state(
+            polled,
+            current,
+            outbound_active=self._sm6_outbound_active(),
+            optimistic_play_active=self._sm6_optimistic_play_active(),
+        )
         if polled == "PLAYING":
-            self._sm6_optimistic_play_until = None
-            return polled
-        if (
-            polled in _STOPPED_TRANSPORT_STATES
-            and current in _ACTIVE_TRANSPORT_STATES
-            and self._sm6_outbound_active()
+            # Hardware confirmed play — keep elapsed pusher running (no time window).
+            pass
+        elif (
+            polled == "PAUSED_PLAYBACK"
+            and current == "PLAYING"
+            and accepted == polled
         ):
-            return current
-        if polled == "PAUSED_PLAYBACK" and current == "PLAYING":
-            until = getattr(self, "_sm6_optimistic_play_until", None)
-            if until is not None and time.monotonic() < until:
-                return current
             self._sm6_clear_optimistic_play()
-        return polled
+            self.state.disarm_elapsed_assume()
+        return accepted
 
     def _sm6_observe_polled_transport(self, previous: str | None, polled: str) -> None:
         """Detect front-panel / remote transport changes and stop fighting the device."""
@@ -1803,51 +2014,34 @@ class PlexDlnaAdapter(object):
                     self.loop,
                 )
             return
-        if polled == "PAUSED_PLAYBACK" and previous in _ACTIVE_TRANSPORT_STATES:
-            self._sm6_clear_optimistic_play()
-            return
+        # Pause teardown is owned by _sm6_should_accept_transport_state once the
+        # pause is accepted — clearing the pusher here killed extrapolated elapsed
+        # before accept could mask startup PAUSED glitches via optimistic_play_active.
         if polled in _STOPPED_TRANSPORT_STATES and previous in _ACTIVE_TRANSPORT_STATES:
-            self._sm6_relinquish_control("device_stopped")
+            from plex.sm6_session_rules import sm6_stop_should_relinquish
+
+            if sm6_stop_should_relinquish(
+                previous,
+                polled,
+                outbound_active=self._sm6_outbound_active(),
+            ):
+                self._sm6_relinquish_control("device_stopped")
 
     async def _sm6_sync_external_playback(self) -> None:
-        """Playback started outside SonoPlay — sync metadata to Plex without taking control."""
+        """Front-panel / remote playback — relinquish Plex session (no queue recovery)."""
         if not self._is_sm6_renderer():
             return
         if self._sm6_plex_play_in_progress:
             return
-        self._sm6_sonoplay_owned_playback = False
-        self._sm6_relinquished_control = False
-        try:
-            transport = await self.dlna.GetTransportInfo()
-            transport_state = getattr(transport, "CurrentTransportState", None)
-            if transport_state not in _ACTIVE_TRANSPORT_STATES:
-                return
-            position = await self.dlna.GetPositionInfo()
-            uri = extract_value(getattr(position, "TrackURI", None), "")
-            rel_time = extract_value(getattr(position, "RelTime", None), "0")
-            self.state.update(state=transport_state, uri=uri or None, position=rel_time)
-            if uri and not self._sm6_uri_is_plex_resolvable(uri):
-                logger.debug(
-                    "%s SM6 external sync skipped: URI not Plex/DLNA resolvable",
-                    self.dlna.name,
-                )
-                return
-            if uri:
-                await self._sm6_sync_from_polled_uri(uri)
-            from dlna.sm6_control import Sm6Control
+        from dlna.sm6_sources import AUDIO_SOURCE_MEDIA_PLAYER
+        from plex.sm6_session_rules import sm6_external_playback_allowed
 
-            playlist_state = await Sm6Control(self.dlna.location_url).read_playlist_state(
-                fetch_tracks=False,
-            )
-            self._sm6_playlist_snapshot = playlist_state
-            if await self._sm6_is_playlist_queue_coherent(playlist_state):
-                await self._sm6_maybe_sync_playlist(force=False)
-            else:
-                await self._sm6_rebuild_plex_playlist_from_sm6(force=False)
-                await self._sm6_maybe_sync_playlist(force=False)
-            self._sm6_wake_waiters()
-        except Exception as exc:
-            logger.debug("%s SM6 external playback sync failed: %s", self.dlna.name, exc)
+        if not sm6_external_playback_allowed(
+            self._sm6_last_audio_source,
+            media_player_id=AUDIO_SOURCE_MEDIA_PLAYER,
+        ):
+            return
+        self._sm6_relinquish_control("external_playback")
 
     def _sm6_uri_is_plex_resolvable(self, uri: str | None) -> bool:
         from plex.sm6_sync import is_plex_resolvable_uri
@@ -1875,50 +2069,95 @@ class PlexDlnaAdapter(object):
         self._suppress_auto_next = True
 
     def _sm6_clear_optimistic_play(self) -> None:
-        self._sm6_optimistic_play_until = None
+        """Stop the elapsed timeline pusher (pause/stop/detach)."""
         task = getattr(self, "_sm6_play_notify_task", None)
         if task is not None and not task.done():
             task.cancel()
         self._sm6_play_notify_task = None
 
-    def _sm6_begin_optimistic_play(self) -> None:
+    def _sm6_enter_playing(self, **update_kwargs) -> None:
+        """Project local transport PLAYING after the SM6 play command completed."""
+        self.state.update(state="PLAYING", **update_kwargs)
+
+    def _sm6_begin_optimistic_play(
+        self,
+        *,
+        elapsed_ms: int | None = None,
+        delay_seconds: float | None = None,
+    ) -> None:
+        """Arm Plex-side elapsed clock + pusher (RelTime only realigns the anchor)."""
         if not self._is_sm6_renderer():
             return
-        self._sm6_optimistic_play_until = (
-            time.monotonic() + settings.sm6_optimistic_play_seconds
+        start_ms = int(self.state.elapsed or 0) if elapsed_ms is None else int(elapsed_ms)
+        delay = (
+            delay_seconds
+            if delay_seconds is not None
+            else settings.sm6_position_assume_play_delay_seconds
         )
-        self.state.arm_elapsed_assume(delay_seconds=0)
+        # Arm synchronously so the pusher never races a lock held by a slow SOAP poll.
+        self.state._arm_elapsed_assume_impl(elapsed_ms=start_ms, delay_seconds=delay)
+        # Mask STOPPED transport glitches until SM6 actually starts (same window as SOAP cmds).
+        self._sm6_mark_outbound_activity()
         task = self._sm6_play_notify_task
         if task is not None and not task.done():
-            task.cancel()
+            return
         if self.loop is not None and not self.loop.is_closed():
-            self._sm6_play_notify_task = asyncio.create_task(
-                self._sm6_play_elapsed_pusher(),
-                name=f"sm6-play-push-{self.dlna.name}",
-            )
+            try:
+                running = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+            if running is self.loop:
+                self._sm6_play_notify_task = self.loop.create_task(
+                    self._sm6_play_elapsed_pusher(),
+                    name=f"sm6-play-push-{self.dlna.name}",
+                )
+            else:
+                self._sm6_play_notify_task = asyncio.run_coroutine_threadsafe(
+                    self._sm6_play_elapsed_pusher(),
+                    self.loop,
+                )
 
     async def _sm6_play_elapsed_pusher(self) -> None:
-        """Wake Plex during the optimistic window to show extrapolation."""
+        """Push extrapolated elapsed to Plex while assume is armed."""
         interval = settings.sm6_play_timeline_push_interval_seconds
         try:
-            await asyncio.sleep(0.05)
-            while (
-                self._sm6_optimistic_play_until is not None
-                and time.monotonic() < self._sm6_optimistic_play_until
-            ):
-                if self.state.state != "PLAYING" or not self.state._elapsed_assume_active:
+            while True:
+                if not self.state._elapsed_assume_active:
                     break
-                self._sm6_wake_waiters()
+                self.state._refresh_assumed_elapsed()
+                # Don't force SOAP poll — extrapolation is Plex-side only.
+                self._sm6_wake_waiters(force_poll=False)
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:
             return
+        finally:
+            self._sm6_play_notify_task = None
 
-    def _sm6_wake_waiters(self) -> None:
-        self.state.check_all_next_loop = True
+    def _sm6_wake_waiters(self, *, force_poll: bool = True) -> None:
+        if force_poll:
+            self.state.check_all_next_loop = True
         for entry in list(self.wait_state_change_events):
             entry["event"].set()
         if not self.no_notice and self.loop is not None and not self.loop.is_closed():
-            asyncio.run_coroutine_threadsafe(self._sm6_notify_plex_timeline(), self.loop)
+            try:
+                running = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+            if running is self.loop:
+                asyncio.create_task(self._sm6_notify_plex_timeline())
+            else:
+                asyncio.run_coroutine_threadsafe(self._sm6_notify_plex_timeline(), self.loop)
+
+    def _sm6_optimistic_play_active(self) -> bool:
+        """True while the elapsed pusher task is alive (whole PLAYING session)."""
+        task = self._sm6_play_notify_task
+        if task is None:
+            return False
+        done = getattr(task, "done", None)
+        if callable(done):
+            return not done()
+        # Concurrent.Future from run_coroutine_threadsafe
+        return not task.done()
 
     async def _sm6_notify_plex_timeline(self) -> None:
         from plex.subscribe import sub_man
@@ -2036,17 +2275,74 @@ class PlexDlnaAdapter(object):
                     return entry
         return None
 
+    def _sm6_remember_track_rating_key(self, track_id: int, track) -> None:
+        rating_key = str(getattr(track, "ratingKey", "") or "")
+        if track_id >= 0 and rating_key.isdigit():
+            self._sm6_track_rating_keys[int(track_id)] = rating_key
+
+    async def _sm6_cache_track_rating_keys_from_playqueue(self) -> None:
+        """Map SM6 track_id → Plex ratingKey from aligned playQueue offsets."""
+        state = self._sm6_playlist_snapshot
+        if state is None or self.queue is None:
+            return
+        total = await self.queue.total_count()
+        if math.isinf(total):
+            return
+        for index, entry in enumerate(state.tracks):
+            plex_offset = self._sm6_queue_base_offset + index
+            if not (0 <= plex_offset < int(total)):
+                continue
+            try:
+                track = await self.queue.track(plex_offset)
+            except (IndexError, ValueError):
+                continue
+            self._sm6_remember_track_rating_key(entry.track_id, track)
+
+    def _sm6_cache_track_rating_keys_from_enqueued(self) -> None:
+        """Map SM6 track_id → Plex ratingKey after a SonoPlay enqueue."""
+        from plex.sm6_sync import sm6_entry_matches_track
+
+        state = self._sm6_playlist_snapshot
+        enqueued = self._sm6_enqueued_tracks
+        if state is None or not enqueued:
+            return
+        used_keys: set[str] = set()
+        for index, entry in enumerate(state.tracks):
+            if entry.track_id in self._sm6_track_rating_keys:
+                used_keys.add(self._sm6_track_rating_keys[entry.track_id])
+                continue
+            if index < len(enqueued):
+                track = enqueued[index]
+                rating_key = str(getattr(track, "ratingKey", "") or "")
+                if rating_key.isdigit() and rating_key not in used_keys:
+                    self._sm6_track_rating_keys[entry.track_id] = rating_key
+                    used_keys.add(rating_key)
+                    continue
+            for track in enqueued:
+                rating_key = str(getattr(track, "ratingKey", "") or "")
+                if not rating_key.isdigit() or rating_key in used_keys:
+                    continue
+                if sm6_entry_matches_track(entry, track):
+                    self._sm6_track_rating_keys[entry.track_id] = rating_key
+                    used_keys.add(rating_key)
+                    break
+
     async def _sm6_refresh_playlist_snapshot(self, *, fetch_tracks: bool = True) -> None:
         if not self._is_sm6_renderer():
             return
         try:
             from dlna.sm6_control import Sm6Control
 
-            state = await Sm6Control(self.dlna.location_url).read_playlist_state(
-                fetch_tracks=fetch_tracks,
-            )
+            sm6 = Sm6Control(self.dlna.location_url)
+
+            async def _read():
+                return await sm6.read_playlist_state(fetch_tracks=fetch_tracks)
+
+            state = await self._sm6_run_read(_read)
             self._sm6_playlist_snapshot = state
             self._sm6_last_queue_track_id = state.current_track_id
+            self._sm6_cache_track_rating_keys_from_enqueued()
+            await self._sm6_cache_track_rating_keys_from_playqueue()
             logger.debug(
                 "%s SM6 playlist snapshot: length=%s current=%s index=%s",
                 self.dlna.name,
@@ -2059,11 +2355,55 @@ class PlexDlnaAdapter(object):
 
     async def _sm6_polled_track_uri(self) -> str | None:
         try:
-            position = await self.dlna.GetPositionInfo()
+            async def _get():
+                return await self.dlna.GetPositionInfo()
+
+            position = await self._sm6_run_read(_get, label="GetPositionInfo")
             uri = extract_value(getattr(position, "TrackURI", None), "")
             return uri or self._sm6_session_uri
         except Exception:
             return self._sm6_session_uri
+
+    async def _sm6_fetch_track_for_rating_key(
+        self,
+        rating_key: str,
+        entry,
+        *,
+        track_id: int = -1,
+        trust_id: bool,
+        source: str,
+    ):
+        from plex.sm6_sync import sm6_entry_matches_track
+
+        track = await self.plex_lib.fetch_metadata(f"/library/metadata/{rating_key}")
+        if track is None:
+            return None
+        if not sm6_entry_matches_track(entry, track):
+            if trust_id:
+                logger.warning(
+                    "%s SM6 resolve: %s ratingKey=%s metadata mismatch "
+                    "entry=%r / %r vs track=%r / %r — trusting ratingKey",
+                    self.dlna.name,
+                    source,
+                    rating_key,
+                    getattr(entry, "title", "?"),
+                    getattr(entry, "artist", "?"),
+                    getattr(track, "title", "?"),
+                    getattr(track, "grandparentTitle", "?"),
+                )
+            else:
+                logger.debug(
+                    "%s SM6 resolve: %s ratingKey=%s mismatch entry %r / %r",
+                    self.dlna.name,
+                    source,
+                    rating_key,
+                    getattr(entry, "title", "?"),
+                    getattr(entry, "artist", "?"),
+                )
+                return None
+        if track_id >= 0:
+            self._sm6_remember_track_rating_key(track_id, track)
+        return track
 
     async def _sm6_resolve_entry_to_track(
         self,
@@ -2072,33 +2412,126 @@ class PlexDlnaAdapter(object):
         queue_index: int = -1,
         album_hint: str | None = None,
         fallback_uri: str | None = None,
+        track_id: int = -1,
     ):
-        if self.queue is not None:
-            if queue_index >= 0:
-                plex_offset = self._sm6_queue_base_offset + queue_index
-                total = await self.queue.total_count()
-                if not math.isinf(total) and 0 <= plex_offset < total:
-                    await self.queue.set_selected_offset(plex_offset)
-                    return await self.queue.selected_track()
-            if await self.queue.select_track_by_metadata(
-                title=entry.title,
-                artist=entry.artist,
-                album=entry.album,
-            ):
-                return await self.queue.selected_track()
-        track = await self.plex_lib.search_track(
+        from plex.dlna_stream_cache import (
+            rating_key_from_pms_uri,
+            rating_key_from_query_param,
+            rating_key_from_sonoplay_transcode_object,
+        )
+        from plex.sm6_sync import (
+            rating_key_for_polled_uri,
+            sm6_entry_matches_track,
+        )
+        from plex.track_metadata_search import sm6_entry_metadata_search_allowed
+
+        uri = fallback_uri or self._sm6_session_uri or ""
+
+        # 1. ?ratingKey= query param (SonoPlay, SM6, or third-party tagger).
+        query_key = rating_key_from_query_param(uri)
+        if query_key:
+            track = await self._sm6_fetch_track_for_rating_key(
+                query_key,
+                entry,
+                track_id=track_id,
+                trust_id=True,
+                source="query param",
+            )
+            if track is not None:
+                return track
+
+        # 2. PMS metadata URI (first fallback after explicit query param).
+        pms_key = rating_key_from_pms_uri(uri)
+        if pms_key:
+            track = await self._sm6_fetch_track_for_rating_key(
+                pms_key,
+                entry,
+                track_id=track_id,
+                trust_id=True,
+                source="PMS URI",
+            )
+            if track is not None:
+                return track
+
+        # 3. SonoPlay transcode object id in stream URL.
+        transcode_key = rating_key_from_sonoplay_transcode_object(uri)
+        if transcode_key:
+            track = await self._sm6_fetch_track_for_rating_key(
+                transcode_key,
+                entry,
+                track_id=track_id,
+                trust_id=True,
+                source="transcode object",
+            )
+            if track is not None:
+                return track
+
+        # 4. SM6 track_id session cache.
+        if track_id >= 0:
+            cached_key = self._sm6_track_rating_keys.get(track_id)
+            if cached_key:
+                track = await self.plex_lib.fetch_metadata(f"/library/metadata/{cached_key}")
+                if track is not None:
+                    return track
+
+        # 5. DLNA URL cache, object_id map, playQueue object_id scan.
+        cached_key = await rating_key_for_polled_uri(
+            self,
+            uri,
+            skip_query_param=True,
+            skip_pms_uri=True,
+            skip_sonoplay_object=True,
+        )
+        if cached_key:
+            track = await self._sm6_fetch_track_for_rating_key(
+                cached_key,
+                entry,
+                track_id=track_id,
+                trust_id=False,
+                source="DLNA cache",
+            )
+            if track is not None:
+                return track
+
+        # 6. playQueue index alignment.
+        if self.queue is not None and queue_index >= 0:
+            plex_offset = self._sm6_queue_base_offset + queue_index
+            total = await self.queue.total_count()
+            if not math.isinf(total) and 0 <= plex_offset < total:
+                queue_track = await self.queue.track(plex_offset)
+                queue_key = str(getattr(queue_track, "ratingKey", "") or "")
+                if queue_key.isdigit():
+                    if not sm6_entry_matches_track(entry, queue_track):
+                        logger.warning(
+                            "%s SM6 resolve: playQueue ratingKey=%s metadata mismatch "
+                            "entry=%r / %r vs queue=%r / %r — using ratingKey",
+                            self.dlna.name,
+                            queue_key,
+                            getattr(entry, "title", "?"),
+                            getattr(entry, "artist", "?"),
+                            getattr(queue_track, "title", "?"),
+                            getattr(queue_track, "grandparentTitle", "?"),
+                        )
+                    if track_id >= 0:
+                        self._sm6_remember_track_rating_key(track_id, queue_track)
+                    return queue_track
+
+        # 7. Metadata search (least reliable).
+        if not sm6_entry_metadata_search_allowed(entry):
+            logger.debug(
+                "%s SM6 resolve: metadata search refused for %r "
+                "(need artist and album or duration)",
+                self.dlna.name,
+                getattr(entry, "title", "?"),
+            )
+            return None
+        return await self.plex_lib.search_track(
             entry.title,
             artist=entry.artist,
             album=entry.album,
             album_hint=album_hint,
+            duration_seconds=getattr(entry, "duration_seconds", None),
         )
-        if track is not None:
-            return track
-        uri = fallback_uri or self._sm6_session_uri or ""
-        rating_key = await self._sm6_rating_key_for_uri(uri)
-        if rating_key:
-            return await self.plex_lib.fetch_metadata(f"/library/metadata/{rating_key}")
-        return None
 
     async def _sm6_apply_queue_track(
         self,
@@ -2107,6 +2540,9 @@ class PlexDlnaAdapter(object):
         entry=None,
         queue_index: int = -1,
     ) -> bool:
+        # Latch may flip mid-await (SOAP/resolve) — re-check before any Plex mirror write.
+        if self._sm6_plex_clients_detached:
+            return False
         if entry is None:
             entry = self._sm6_entry_for_track_id(track_id)
             if entry is None:
@@ -2121,17 +2557,29 @@ class PlexDlnaAdapter(object):
                 except Exception as exc:
                     logger.debug("%s SM6 fetch track %s failed: %s", self.dlna.name, track_id, exc)
                     return False
-        if entry is None:
+        if entry is None or self._sm6_plex_clients_detached:
             return False
 
-        track = await self._sm6_resolve_entry_to_track(entry, queue_index=queue_index)
-        if track is None:
-            logger.debug(
-                "%s SM6 sync: impossible de résoudre %s / %s",
-                self.dlna.name,
-                entry.title,
-                entry.artist,
-            )
+        polled_uri = await self._sm6_polled_track_uri()
+        if self._sm6_plex_clients_detached:
+            return False
+        if polled_uri:
+            self._sm6_session_uri = polled_uri
+
+        track = await self._sm6_resolve_entry_to_track(
+            entry,
+            queue_index=queue_index,
+            fallback_uri=polled_uri,
+            track_id=track_id,
+        )
+        if track is None or self._sm6_plex_clients_detached:
+            if track is None:
+                logger.debug(
+                    "%s SM6 sync: impossible de résoudre %s / %s",
+                    self.dlna.name,
+                    entry.title,
+                    entry.artist,
+                )
             return False
 
         old_key = getattr(self.current_track_info, "ratingKey", None)
@@ -2146,11 +2594,14 @@ class PlexDlnaAdapter(object):
 
         self.current_track_info = track
         self._sm6_last_queue_track_id = track_id
+        self._sm6_remember_track_rating_key(track_id, track)
         from plex.url_resolver import get_url_resolver
         try:
             self._sm6_session_uri = await get_url_resolver().resolve_stream_url(track)
         except LookupError:
             pass
+        if self._sm6_plex_clients_detached:
+            return False
         logger.info(
             "%s SM6 sync playlist -> %s (ratingKey=%s, track_id=%s, index=%s)",
             self.dlna.name,
@@ -2168,24 +2619,51 @@ class PlexDlnaAdapter(object):
         """Use the queue mirror track so timeline carries a valid playQueueItemID."""
         if self.queue is None:
             return self.current_track_info
+        expected_key = str(getattr(self.current_track_info, "ratingKey", "") or "")
         try:
             queue_track = await self.queue.selected_track()
         except Exception as exc:
             logger.debug("%s SM6 queue selected_track failed: %s", self.dlna.name, exc)
+            return self.current_track_info
+        queue_key = str(getattr(queue_track, "ratingKey", "") or "")
+        if expected_key.isdigit() and queue_key == expected_key:
+            self.current_track_info = queue_track
+            return queue_track
+        if expected_key.isdigit():
+            key = f"/library/metadata/{expected_key}"
+            if await self.queue.select_track_key(key):
+                try:
+                    queue_track = await self.queue.selected_track()
+                except Exception as exc:
+                    logger.debug("%s SM6 queue selected_track failed: %s", self.dlna.name, exc)
+                    return self.current_track_info
+                self.current_track_info = queue_track
+                return queue_track
+        if expected_key.isdigit() and queue_key and queue_key != expected_key:
+            logger.warning(
+                "%s SM6 queue mirror mismatch: expected ratingKey=%s got %s (%r)",
+                self.dlna.name,
+                expected_key,
+                queue_key,
+                getattr(queue_track, "title", "?"),
+            )
             return self.current_track_info
         self.current_track_info = queue_track
         return queue_track
 
     async def _sm6_on_sm6_track_advanced(self) -> None:
         """Reset position after SM6 auto-next; timeline notify follows via publish."""
-        self.state.disarm_elapsed_assume()
-        self.state.elapsed = 0
-        if hasattr(self.state, "_sync_elapsed_anchor"):
-            self.state._sync_elapsed_anchor(0)
+        self._sm6_clear_optimistic_play()
+        self._sm6_begin_optimistic_play(
+            elapsed_ms=0,
+            delay_seconds=settings.sm6_position_assume_skip_delay_seconds,
+        )
 
     async def _sm6_sync_timeline_for_poll(self) -> None:
         """Refresh queue selection before long-poll clients (e.g. Plexamp) read timeline."""
         if not self._is_sm6_renderer() or self.queue is None:
+            return
+        if self._sm6_plex_clients_detached:
             return
         if self.state.state not in _ACTIVE_TRANSPORT_STATES:
             return
@@ -2197,10 +2675,20 @@ class PlexDlnaAdapter(object):
         await self._sm6_maybe_sync_playlist(force=True)
 
     async def _sm6_sync_plex_queue_offset(self, queue_index: int) -> bool:
-        """Move Plex playQueue selection to match SM6 MediaQueueIndex."""
+        """Move Plex playQueue selection to match the resolved SM6 track."""
+        from plex.sm6_session_rules import plex_playqueue_offset
+
+        if self._sm6_plex_clients_detached:
+            return False
         if queue_index < 0 or self.queue is None:
             return False
-        plex_offset = self._sm6_queue_base_offset + queue_index
+        expected_key = str(getattr(self.current_track_info, "ratingKey", "") or "")
+        if expected_key.isdigit():
+            await self._sm6_bind_current_track_to_queue()
+            current = await self.queue.selected_offset()
+            plex_offset = plex_playqueue_offset(self._sm6_queue_base_offset, queue_index)
+            return current != plex_offset
+        plex_offset = plex_playqueue_offset(self._sm6_queue_base_offset, queue_index)
         current = await self.queue.selected_offset()
         changed = current != plex_offset
         if changed:
@@ -2236,18 +2724,15 @@ class PlexDlnaAdapter(object):
         rating_keys_len: int,
     ) -> int:
         """Map SM6 playback position to Plex playQueue selected index."""
-        queue_index = playlist_state.media_queue_index
-        if 0 <= queue_index < len(resolved_queue_map):
-            mapped = resolved_queue_map[queue_index]
-            if mapped is not None and 0 <= mapped < rating_keys_len:
-                return mapped
-        current_id = playlist_state.current_track_id
-        for i, entry in enumerate(playlist_state.tracks):
-            if entry.track_id == current_id and i < len(resolved_queue_map):
-                mapped = resolved_queue_map[i]
-                if mapped is not None and 0 <= mapped < rating_keys_len:
-                    return mapped
-        return 0
+        from plex.sm6_session_rules import plex_queue_index_from_sm6
+
+        return plex_queue_index_from_sm6(
+            media_queue_index=playlist_state.media_queue_index,
+            current_track_id=playlist_state.current_track_id,
+            track_ids=tuple(entry.track_id for entry in playlist_state.tracks),
+            resolved_queue_map=resolved_queue_map,
+            rating_keys_len=rating_keys_len,
+        )
 
     async def _sm6_resolve_playlist_to_rating_keys(
         self,
@@ -2275,6 +2760,7 @@ class PlexDlnaAdapter(object):
                     if polled_uri and (i == queue_index or entry.track_id == current_id)
                     else None
                 ),
+                track_id=entry.track_id,
             )
             if track is None:
                 resolved_queue_map.append(None)
@@ -2455,130 +2941,28 @@ class PlexDlnaAdapter(object):
         return self._plex_lib_ready()
 
     async def _sm6_rebuild_plex_playlist_from_sm6(self, *, force: bool = False) -> bool:
-        """Rebuild the Plex playQueue to mirror the SM6 native playlist."""
+        """Disabled — SM6 native playlist is never mirrored back into Plex."""
         if not self._is_sm6_renderer():
             return False
-        if self._sm6_plex_play_in_progress and not force:
-            return False
-        if self._sm6_sonoplay_owned_playback and not force:
-            return False
-        if self._sm6_relinquished_control and not self._sm6_on_media_player_source():
-            return False
-        if time.monotonic() < self._sm6_playlist_rebuild_backoff_until:
-            return False
-        try:
-            from dlna.sm6_control import Sm6Control
-            from plex.play_queue import PlayQueue
-
-            playlist_state = await Sm6Control(self.dlna.location_url).read_playlist_state(
-                fetch_tracks=True,
-            )
-            if not force and self._sm6_passive_sync_blocked():
-                logger.debug(
-                    "%s SM6 rebuild aborted after read_playlist_state (Plex play in progress)",
-                    self.dlna.name,
-                )
-                return False
-            self._sm6_playlist_snapshot = playlist_state
-            fingerprint = self._sm6_playlist_fingerprint(playlist_state)
-            if not force and fingerprint == self._sm6_last_plex_playlist_fingerprint:
-                return False
-            if playlist_state.length <= 0:
-                return False
-
-            if not await self._ensure_plex_lib_for_sm6_api():
-                self._sm6_playlist_rebuild_backoff_until = time.monotonic() + 30.0
-                logger.debug(
-                    "%s SM6 playlist sync: Plex PMS unavailable (token or host missing)",
-                    self.dlna.name,
-                )
-                return False
-
-            rating_keys, tracks, selected_index = await self._sm6_resolve_playlist_to_rating_keys(
-                playlist_state,
-            )
-            if not force and self._sm6_passive_sync_blocked():
-                logger.debug(
-                    "%s SM6 rebuild aborted after resolve (Plex play in progress)",
-                    self.dlna.name,
-                )
-                return False
-            if not rating_keys:
-                logger.debug("%s SM6 playlist sync: no resolvable tracks", self.dlna.name)
-                return False
-
-            queue = await PlayQueue.create_from_rating_keys(
-                self.plex_lib,
-                rating_keys,
-                selected_index=selected_index,
-                shuffle=self.shuffle,
-                repeat=self._repeat_value(),
-                sequential=True,
-            )
-            if not force and self._sm6_passive_sync_blocked():
-                logger.debug(
-                    "%s SM6 rebuild aborted before queue swap (Plex play in progress)",
-                    self.dlna.name,
-                )
-                return False
-            self.queue = queue
-            self._sm6_queue_base_offset = 0
-            self._sm6_last_queue_track_id = playlist_state.current_track_id
-            self._sm6_last_plex_playlist_fingerprint = fingerprint
-            self.current_track_info = await queue.selected_track()
-            from plex.url_resolver import get_url_resolver
-            try:
-                self._sm6_session_uri = await get_url_resolver().resolve_stream_url(
-                    self.current_track_info,
-                )
-            except LookupError:
-                pass
-            plex_total = await queue.total_count()
-            logger.info(
-                "%s SM6 → Plex playQueue rebuilt (%s Plex tracks from %d SM6 entries, "
-                "selected=%s, title=%s)",
-                self.dlna.name,
-                plex_total if not math.isinf(plex_total) else len(rating_keys),
-                playlist_state.length,
-                selected_index,
-                getattr(self.current_track_info, "title", "?"),
-            )
-            if (
-                not math.isinf(plex_total)
-                and int(plex_total) != len(rating_keys)
-            ):
-                logger.warning(
-                    "%s SM6 playQueue count mismatch: Plex=%s resolved=%s SM6=%s",
-                    self.dlna.name,
-                    plex_total,
-                    len(rating_keys),
-                    playlist_state.length,
-                )
-            self._sm6_publish_track_change(self.current_track_info)
-            self._sm6_playlist_rebuild_backoff_until = 0.0
-            return True
-        except Exception as exc:
-            self._sm6_playlist_rebuild_backoff_until = time.monotonic() + 15.0
-            logger.warning("%s SM6 rebuild Plex playQueue failed: %s", self.dlna.name, exc)
-            return False
+        logger.debug(
+            "%s SM6 rebuild Plex playQueue skipped (recovery disabled)",
+            self.dlna.name,
+        )
+        return False
 
     async def _sm6_maybe_sync_playlist(self, *, force: bool = False) -> None:
         if not self._is_sm6_renderer():
             return
+        if self._sm6_plex_clients_detached:
+            return
         if self._sm6_plex_play_in_progress and not force:
             return
         if self._sm6_relinquished_control and not self._sm6_on_media_player_source():
             return
-        if not force and self._sm6_any_poll_paused_sync():
-            return
         if not force and self.state.state not in _ACTIVE_TRANSPORT_STATES:
             return
         if not self._sm6_sonoplay_owned_playback:
-            if not force and self._sm6_playlist_snapshot:
-                if await self._sm6_is_playlist_queue_coherent(self._sm6_playlist_snapshot):
-                    return
-            if await self._sm6_rebuild_plex_playlist_from_sm6(force=force):
-                return
+            return
         try:
             from dlna.sm6_control import Sm6Control
 
@@ -2592,14 +2976,17 @@ class PlexDlnaAdapter(object):
                         return
                 else:
                     return
+            # Detach can land during get_current_queue_position / queue I/O above.
+            if self._sm6_plex_clients_detached:
+                return
             await self._sm6_apply_queue_track(current_id, queue_index=queue_index)
         except Exception as exc:
             logger.debug("%s SM6 playlist poll sync failed: %s", self.dlna.name, exc)
 
     async def _sm6_sync_after_skip(self) -> None:
         await asyncio.sleep(settings.sm6_position_assume_skip_delay_seconds)
-        await self._sm6_maybe_sync_playlist(force=True)
         await self._sm6_refresh_playlist_snapshot()
+        await self._sm6_maybe_sync_playlist(force=True)
         self._sm6_wake_waiters()
         await self._sm6_notify_plex_timeline()
 
@@ -2638,10 +3025,13 @@ class PlexDlnaAdapter(object):
             return
         if self._sm6_relinquished_control:
             return
-        from dlna.sm6_control import Sm6Control
 
         self._sm6_mark_outbound_activity()
-        await Sm6Control(self.dlna.location_url).set_shuffle(self.shuffle > 0)
+
+        async def _set_shuffle() -> None:
+            await self._sm6_control().set_shuffle(self.shuffle > 0)
+
+        await self._sm6_run_queue(_set_shuffle, label="SetShuffle")
         self._sm6_wake_waiters()
 
     async def set_repeat(self, value: int) -> None:
@@ -2652,21 +3042,26 @@ class PlexDlnaAdapter(object):
             return
         if self._sm6_relinquished_control:
             return
-        from dlna.sm6_control import Sm6Control
 
         # SM6: binary repeat (whole queue). repeat=1 (track) stays software SonoPlay.
         self._sm6_mark_outbound_activity()
-        await Sm6Control(self.dlna.location_url).set_repeat(value == 2)
+
+        async def _set_repeat() -> None:
+            await self._sm6_control().set_repeat(value == 2)
+
+        await self._sm6_run_queue(_set_repeat, label="SetRepeat")
         self._sm6_wake_waiters()
 
     async def _sm6_poll_shuffle_repeat(self) -> None:
         if not self._is_sm6_renderer():
             return
         try:
-            from dlna.sm6_control import Sm6Control
+            sm6 = self._sm6_control()
 
-            sm6 = Sm6Control(self.dlna.location_url)
-            shuffle_on, repeat_on = await asyncio.gather(sm6.get_shuffle(), sm6.get_repeat())
+            async def _read():
+                return await asyncio.gather(sm6.get_shuffle(), sm6.get_repeat())
+
+            shuffle_on, repeat_on = await self._sm6_run_read(_read)
             new_shuffle = 1 if shuffle_on else 0
             new_repeat = 2 if repeat_on else (1 if self._repeat_value() == 1 else 0)
             changed = new_shuffle != self.shuffle or new_repeat != self._repeat_value()
@@ -2684,6 +3079,17 @@ class PlexDlnaAdapter(object):
         except Exception as exc:
             logger.debug("%s SM6 shuffle/repeat poll failed: %s", self.dlna.name, exc)
 
+    def _sm6_abort_queue_work(self) -> None:
+        """Cancel in-flight QueueFolder tail and drain the dispatcher queue lane."""
+        task = getattr(self, "_sm6_tail_fill_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+        self._sm6_tail_fill_task = None
+        try:
+            self._sm6_dispatcher().bump_generation()
+        except Exception as exc:
+            logger.debug("%s SM6 abort queue work: dispatcher bump failed: %s", self.dlna.name, exc)
+
     def _sm6_relinquish_control(self, reason: str) -> None:
         """User took over on the SM6 (other source, front panel, etc.) — stop fighting."""
         already = self._sm6_relinquished_control
@@ -2691,6 +3097,8 @@ class PlexDlnaAdapter(object):
             return
         if not already:
             logger.info("%s SM6 relinquishing Plex control (%s)", self.dlna.name, reason)
+        # plex_stop used to leave QueueFolder APPEND racing the STOP (see log 11:16:46–53).
+        self._sm6_abort_queue_work()
         self._sm6_relinquished_control = True
         if reason != "plex_stop":
             self._sm6_sonoplay_owned_playback = False
@@ -2698,33 +3106,84 @@ class PlexDlnaAdapter(object):
         self._sm6_clear_optimistic_play()
         self._suppress_auto_next = True
         self._last_operation_finish_time = None
-        self.state.update(state="STOPPED", uri=None)
-        self._sm6_session_uri = None
+        if reason in {"plex_stop", "device_stopped", "external_playback"}:
+            self._sm6_schedule_plex_neutral(reason)
+        else:
+            self.state.update(state="STOPPED", uri=None)
+            self._sm6_session_uri = None
         self.state.check_all_next_loop = True
         self._sm6_wake_waiters()
 
-    async def _sm6_poll_audio_source(self) -> None:
-        if not self._is_sm6_renderer() or self._sm6_relinquished_control:
+    async def _sm6_detach_plex_for_external_source(self, source_id: int) -> None:
+        """Push TIMELINE_DISCONNECTED so clients fall back to local play.
+
+        Keeps the plex.tv bind token — account unlink is only via /api/plex-disconnect.
+        Reclaim of Media Player happens only on playMedia (_sm6_begin_plex_play / ensure_ready).
+        """
+        from plex.subscribe import sub_man
+
+        # STOPPED before notify so PMS/poll clients see a ended session, not PLAYING.
+        self.state.update(state="STOPPED", uri=None)
+        self._sm6_session_uri = None
+        logger.info(
+            "%s SM6 detached Plex clients (audio_source=%s)",
+            self.dlna.name,
+            source_id,
+        )
+        try:
+            await sub_man.notify_device_disconnected(self.dlna)
+        except Exception as exc:
+            logger.debug(
+                "%s SM6 detach timeline notify failed: %s",
+                self.dlna.name,
+                exc,
+            )
+        # Plexamp often has no push subscriber — force PMS timeline stopped while
+        # the playQueue mirror still exists (stop/neutral may clear it next).
+        try:
+            await sub_man.notify_server_device(self.dlna, force=True)
+        except Exception as exc:
+            logger.debug(
+                "%s SM6 detach PMS timeline notify failed: %s",
+                self.dlna.name,
+                exc,
+            )
+        # Long-poll waiters already woken in _sm6_note_polled_audio_source; nudge again
+        # after latch + drop so the next msg_for_device is TIMELINE_DISCONNECTED.
+        for entry in list(self.wait_state_change_events):
+            entry["event"].set()
+
+    async def _sm6_on_plex_client_subscribe(self) -> None:
+        """Subscribe must not force Media Player — that belongs to playMedia.
+
+        Plexamp often re-subscribes / polls after disconnected=\"1\". Ensuring source 10
+        here restarts SM6 queue playback and undoes an intentional source change.
+        """
+        if not self._is_sm6_renderer():
             return
-        from dlna.sm6_control import Sm6Control
-        from dlna.sm6_sources import AUDIO_SOURCE_MEDIA_PLAYER
+        if self._sm6_plex_clients_detached:
+            logger.info(
+                "%s SM6 Plex subscribe while detached — leaving latch (no Media Player reclaim)",
+                self.dlna.name,
+            )
+
+    async def _sm6_poll_audio_source(self) -> None:
+        """Standalone audio-source poll (tests / manual). State loop uses state-poll batch."""
+        if not self._is_sm6_renderer() or self._sm6_plex_clients_detached:
+            return
 
         try:
-            current = await Sm6Control(self.dlna.location_url).get_current_audio_source_id()
+            async def _read():
+                current = await self._sm6_control().get_current_audio_source_id()
+                return self._sm6_note_polled_audio_source(current)
+
+            detach_source = await self._sm6_run_read(_read, label="GetAudioSourceByNumber")
         except Exception as exc:
-            logger.debug("%s SM6 audio source poll failed: %s", self.dlna.name, exc)
+            logger.info("%s SM6 audio source poll failed: %s", self.dlna.name, exc)
             return
-        if current is None:
-            return
-        previous = self._sm6_last_audio_source
-        self._sm6_last_audio_source = current
-        if current == AUDIO_SOURCE_MEDIA_PLAYER:
-            return
-        if previous == current:
-            return
-        active = self.state.state in _ACTIVE_TRANSPORT_STATES or self.queue is not None
-        if active:
-            self._sm6_relinquish_control(f"audio_source={current}")
+
+        if detach_source is not None:
+            await self._sm6_detach_plex_for_external_source(detach_source)
 
     def _sm6_note_playback_start(self, seconds: float = 5.0) -> None:
         """Short window where Plex stale volume=0 must not reach the hardware."""
@@ -2740,29 +3199,32 @@ class PlexDlnaAdapter(object):
 
     def _sm6_should_ignore_volume_write(self, requested: int) -> bool:
         """Reject Plex volume writes that disagree with the device during play startup."""
-        if not self._is_sm6_renderer() or not self._sm6_in_volume_grace_period():
+        from plex.sm6_session_rules import ignore_stale_plex_volume_write
+
+        if not self._is_sm6_renderer():
             return False
-        device_plex = self.state.volume
-        if device_plex is None:
-            return False
-        device_plex = int(device_plex)
-        requested = int(requested)
-        if requested == 0 and device_plex > 5:
-            logger.info(
-                "%s ignore volume=0 during play start (device=%s%%)",
-                self.dlna.name,
-                device_plex,
-            )
-            return True
-        if abs(requested - device_plex) > 20:
-            logger.info(
-                "%s ignore stale volume=%s during play start (device=%s%%)",
-                self.dlna.name,
-                requested,
-                device_plex,
-            )
-            return True
-        return False
+        ignored = ignore_stale_plex_volume_write(
+            requested,
+            self.state.volume,
+            in_grace_period=self._sm6_in_volume_grace_period(),
+        )
+        if ignored:
+            device_plex = int(self.state.volume)
+            req = int(requested)
+            if req == 0 and device_plex > 5:
+                logger.info(
+                    "%s ignore volume=0 during play start (device=%s%%)",
+                    self.dlna.name,
+                    device_plex,
+                )
+            else:
+                logger.info(
+                    "%s ignore stale volume=%s during play start (device=%s%%)",
+                    self.dlna.name,
+                    req,
+                    device_plex,
+                )
+        return ignored
 
     async def _sm6_restore_volume_after_source_switch(self, preserved_level: float) -> None:
         """Re-apply level if switching to Media Player reset hardware volume."""
@@ -2807,12 +3269,14 @@ class PlexDlnaAdapter(object):
                 preserved_level = await self._sm6_get_device_level()
 
         self._sm6_relinquished_control = False
+        self._sm6_plex_clients_detached = False
         self._sm6_sonoplay_owned_playback = True
         self._sm6_mark_outbound_activity()
         self._sm6_note_playback_start()
         logger.info("%s SM6 ensure_ready: power + Media Player source", self.dlna.name)
         await sm6.ensure_power_on()
         await sm6.ensure_media_player_source()
+        self._sm6_last_audio_source = AUDIO_SOURCE_MEDIA_PLAYER
 
         if preserved_level is not None:
             await self._sm6_restore_volume_after_source_switch(preserved_level)
@@ -2986,8 +3450,9 @@ class PlexDlnaAdapter(object):
             self.plex_lib.update(query_params)
 
         sm6_play = self._is_sm6_renderer()
+        play_epoch = 0
         if sm6_play:
-            self._sm6_begin_plex_play()
+            play_epoch = self._sm6_begin_plex_play()
 
         controller = self.virtual_controller()
         if controller is not None:
@@ -3005,11 +3470,24 @@ class PlexDlnaAdapter(object):
         self.queue = self.plex_lib.get_queue(container_key)
         await self.queue.get_info()
         play_succeeded = False
-        play_timeout = 90.0
+        play_timeout = 20.0 if sm6_play else 90.0
         try:
             if key:
-                logger.info("%s play_media requested key=%s", self.dlna.name, key)
+                logger.info(
+                    "%s play_media requested key=%s containerKey=%s",
+                    self.dlna.name,
+                    key,
+                    container_key,
+                )
                 if not await self.queue.select_track_key(key):
+                    if _is_play_queue_container(container_key):
+                        logger.error(
+                            "%s aborting play_media: key=%s not found in playQueue "
+                            "(album fallback disabled for playQueues)",
+                            self.dlna.name,
+                            key,
+                        )
+                        return
                     metadata = await self.plex_lib.fetch_metadata(key)
                     if metadata and getattr(metadata, "type", None) == "album":
                         logger.info(
@@ -3057,8 +3535,20 @@ class PlexDlnaAdapter(object):
             )
             raise
         finally:
-            if sm6_play:
+            # Newer playMedia bumps epoch — do not clear flag / abort / wipe queue.
+            if sm6_play and play_epoch == self._sm6_plex_play_epoch:
                 self._sm6_plex_play_in_progress = False
+                if (
+                    not play_succeeded
+                    and self.state.state in _ACTIVE_TRANSPORT_STATES
+                    and self.current_track_info is not None
+                ):
+                    logger.warning(
+                        "%s play_media timed out but SM6 is playing — keeping Plex session",
+                        self.dlna.name,
+                    )
+                    play_succeeded = True
+                    self._sm6_mark_playback_owned()
                 if not play_succeeded:
                     self._sm6_abort_plex_play_takeover()
 
@@ -3079,11 +3569,16 @@ class PlexDlnaAdapter(object):
         from plex.device_profiles import needs_plex_dlna_stream_url
         if needs_plex_dlna_stream_url(self.dlna):
             queue_tracks = await self._all_queue_tracks()
-            if len(queue_tracks) <= 1:
+            total = await self.queue.total_count()
+            multi_track_queue = len(queue_tracks) > 1 or (
+                not math.isinf(total) and int(total) > 1
+            )
+            if not multi_track_queue:
                 logger.info(
-                    "%s SM6 single-track playMedia (queue len=%s) — PLAY_NOW only",
+                    "%s SM6 single-track playMedia (queue len=%s total=%s) — PLAY_NOW only",
                     self.dlna.name,
                     len(queue_tracks),
+                    "?" if math.isinf(total) else total,
                 )
                 await self._play_sm6_track(
                     track,
@@ -3093,7 +3588,6 @@ class PlexDlnaAdapter(object):
                 )
                 return
             mode = await self._detect_sm6_play_mode()
-            total = await self.queue.total_count()
             logger.info(
                 "%s SM6 play mode=%s queue_total=%s",
                 self.dlna.name,
@@ -3190,7 +3684,38 @@ class PlexDlnaAdapter(object):
         from plex.sm6_queue_plan import detect_sm6_play_mode_from_tracks
 
         tracks = await self._all_queue_tracks()
-        return detect_sm6_play_mode_from_tracks(tracks)
+        mode = detect_sm6_play_mode_from_tracks(tracks)
+        if mode != "album":
+            return mode
+        parent_keys = {
+            str(getattr(track, "parentRatingKey", "") or "")
+            for track in tracks
+            if getattr(track, "parentRatingKey", None)
+        }
+        if len(parent_keys) != 1:
+            return mode
+        parent_key = next(iter(parent_keys))
+        counts = await self._sm6_album_track_counts({parent_key})
+        album_count = counts.get(parent_key, 0)
+        total = await self.queue.total_count()
+        if album_count <= 0 or len(tracks) != album_count:
+            logger.info(
+                "%s SM6 play mode album->playlist (partial album in playQueue: "
+                "queue_len=%s album_leafCount=%s)",
+                self.dlna.name,
+                len(tracks),
+                album_count,
+            )
+            return "playlist"
+        if not math.isinf(total) and int(total) != album_count:
+            logger.info(
+                "%s SM6 play mode album->playlist (playQueue total=%s != album_leafCount=%s)",
+                self.dlna.name,
+                total,
+                album_count,
+            )
+            return "playlist"
+        return mode
 
     async def _sm6_album_rating_key(self) -> str:
         track = await self.queue.selected_track()
@@ -3260,6 +3785,7 @@ class PlexDlnaAdapter(object):
         *,
         paused: bool = False,
         verbose: bool = True,
+        playlist_item: bool = False,
     ) -> tuple[str, str, int]:
         """DIDL, stream URL, and skip_count for one SM6 QueueFolder track item."""
         if self.queue is not None and await self.queue.track_needs_transcode(track):
@@ -3289,9 +3815,28 @@ class PlexDlnaAdapter(object):
         from plex.url_resolver import _DLNA_RESOLVE_TIMEOUT_SECONDS
 
         didl, skip_count = await asyncio.wait_for(
-            resolver.resolve_play_didl(track, start_playback=not paused),
+            resolver.resolve_play_didl(
+                track,
+                start_playback=not paused,
+                prefer_track_didl=playlist_item,
+            ),
             timeout=_DLNA_RESOLVE_TIMEOUT_SECONDS,
         )
+        if skip_count > 0:
+            from plex.url_resolver import album_rating_key_from_track
+
+            album_key = album_rating_key_from_track(track)
+            album_tracks: list = []
+            if album_key and self.queue is not None:
+                album_tracks = [
+                    queued
+                    for queued in await self._all_queue_tracks()
+                    if str(getattr(queued, "parentRatingKey", "") or "") == album_key
+                ]
+            if album_key and not album_tracks:
+                album_tracks = await self.plex_lib.fetch_album_tracks(album_key)
+            if album_tracks:
+                didl = await resolver.tag_didl_rating_keys(didl, album_tracks)
         url = await asyncio.wait_for(
             resolver.resolve_stream_url(track),
             timeout=_DLNA_RESOLVE_TIMEOUT_SECONDS,
@@ -3309,12 +3854,14 @@ class PlexDlnaAdapter(object):
         *,
         segment_kind: str,
         replace_transcode_queue: bool = False,
+        replace_playlist_queue: bool = False,
     ) -> str:
         from dlna.sm6_queue import initial_sm6_queue_action
 
         return initial_sm6_queue_action(
             segment_kind=segment_kind,
             replace_transcode_queue=replace_transcode_queue,
+            replace_playlist_queue=replace_playlist_queue,
         )
 
     async def _play_sm6_track(
@@ -3325,9 +3872,7 @@ class PlexDlnaAdapter(object):
         paused: bool = False,
         plex_takeover: bool = False,
     ) -> None:
-        from dlna.sm6_soap_lane import priority_transport_soap
-
-        async def _dispatch() -> None:
+        async def _run() -> None:
             await self._play_sm6_track_impl(
                 track,
                 offset=offset,
@@ -3335,7 +3880,7 @@ class PlexDlnaAdapter(object):
                 plex_takeover=plex_takeover,
             )
 
-        await priority_transport_soap(str(self.dlna.uuid), _dispatch)
+        await self._sm6_run_transport(_run, label="play track")
 
     async def _play_sm6_track_impl(
         self,
@@ -3395,11 +3940,11 @@ class PlexDlnaAdapter(object):
         self._sm6_enqueued_tracks = (track,)
         selected = await self.queue.selected_offset() if self.queue else 0
         self._sm6_queue_base_offset = selected
-        self.state.update(
-            state="PAUSED_PLAYBACK" if paused else "PLAYING",
-            uri=url,
-            position=str(timedelta(milliseconds=offset)) if offset else "0",
-        )
+        position = str(timedelta(milliseconds=offset)) if offset else "0"
+        if paused:
+            self.state.update(state="PAUSED_PLAYBACK", uri=url, position=position)
+        else:
+            self._sm6_enter_playing(uri=url, position=position)
         await self._sm6_after_queue_folder(offset=offset, paused=paused)
         await self._sm6_refresh_playlist_snapshot()
         self._sm6_mark_playback_owned()
@@ -3413,9 +3958,7 @@ class PlexDlnaAdapter(object):
         paused: bool = False,
         plex_takeover: bool = False,
     ) -> None:
-        from dlna.sm6_soap_lane import priority_transport_soap
-
-        async def _dispatch() -> None:
+        async def _run() -> None:
             await self._play_sm6_album_impl(
                 album,
                 offset=offset,
@@ -3423,7 +3966,7 @@ class PlexDlnaAdapter(object):
                 plex_takeover=plex_takeover,
             )
 
-        await priority_transport_soap(str(self.dlna.uuid), _dispatch)
+        await self._sm6_run_transport(_run, label="play album")
 
     async def _play_sm6_album_impl(
         self,
@@ -3502,6 +4045,8 @@ class PlexDlnaAdapter(object):
             len(album_tracks),
         )
         didl = await resolver.resolve_didl(album, media_kind="album")
+        if album_tracks:
+            didl = await resolver.tag_didl_rating_keys(didl, album_tracks)
 
         server_udn = await self._sm6_plex_server_udn()
         sm6 = Sm6Control(self.dlna.location_url)
@@ -3525,11 +4070,11 @@ class PlexDlnaAdapter(object):
         self._sm6_enqueued_tracks = tuple(album_tracks) if album_tracks else ()
         self._sm6_session_uri = url
         self._sm6_queue_base_offset = 0
-        self.state.update(
-            state="PAUSED_PLAYBACK" if paused else "PLAYING",
-            uri=url,
-            position=str(timedelta(milliseconds=offset)) if offset else "0",
-        )
+        position = str(timedelta(milliseconds=offset)) if offset else "0"
+        if paused:
+            self.state.update(state="PAUSED_PLAYBACK", uri=url, position=position)
+        else:
+            self._sm6_enter_playing(uri=url, position=position)
         await self._sm6_after_queue_folder(offset=offset, paused=paused)
         await self._sm6_refresh_playlist_snapshot()
         self._sm6_mark_playback_owned()
@@ -3546,16 +4091,14 @@ class PlexDlnaAdapter(object):
         paused: bool = False,
         plex_takeover: bool = False,
     ) -> None:
-        from dlna.sm6_soap_lane import priority_transport_soap
-
-        async def _dispatch() -> None:
+        async def _run() -> None:
             await self._play_sm6_playlist_impl(
                 offset=offset,
                 paused=paused,
                 plex_takeover=plex_takeover,
             )
 
-        await priority_transport_soap(str(self.dlna.uuid), _dispatch)
+        await self._sm6_run_transport(_run, label="play playlist phase A")
 
     async def _play_sm6_playlist_impl(
         self,
@@ -3564,128 +4107,205 @@ class PlexDlnaAdapter(object):
         paused: bool = False,
         plex_takeover: bool = False,
     ) -> None:
-        from dlna.sm6_control import Sm6Control
         from dlna.sm6_queue import sm6_action_for_enqueue
         from plex.url_resolver import get_url_resolver
-        from settings import settings
 
         await self._ensure_sm6_ready(plex_takeover=plex_takeover)
         resolver = get_url_resolver()
         server_udn = await self._sm6_plex_server_udn()
-
-        sm6 = Sm6Control(self.dlna.location_url)
+        sm6 = self._sm6_control()
         self._sm6_mark_outbound_activity(90.0)
 
         selected_offset = await self.queue.selected_offset()
-        tracks = await self._all_queue_tracks()
         local_start = self.queue.start_offset or 0
         start_index = max(0, selected_offset - local_start)
-        queue_tracks = tracks[start_index:]
+        first_track = await self.queue.selected_track()
+        total = await self.queue.total_count()
+        multi_track_queue = not math.isinf(total) and int(total) > 1
+        if not multi_track_queue:
+            available = await self.queue.available_tracks()
+            multi_track_queue = len(available) > 1
 
-        if not queue_tracks:
-            raise LookupError("SM6 playlist is empty")
-
-        segments = await self._plan_sm6_queue_segments(queue_tracks)
-        track_segments = sum(1 for segment in segments if segment.kind == "track")
-        album_segments = sum(1 for segment in segments if segment.kind == "album")
-        logger.info(
-            "%s SM6 queue plan: %s track(s) -> %s segment(s) "
-            "(%s album container(s), %s track SOAP call(s))",
-            self.dlna.name,
-            len(queue_tracks),
-            len(segments),
-            album_segments,
-            track_segments,
-        )
-
-        first_track = queue_tracks[0]
-        _, first_url, _ = await self._sm6_resolve_track_playback(
+        replace_playlist_queue = plex_takeover and multi_track_queue
+        didl, first_url, skip_count = await self._sm6_resolve_track_playback(
             first_track,
             resolver,
             paused=paused,
+            playlist_item=True,
         )
-
-        transcode_track_playlist = track_segments > 0 and album_segments == 0
-        if transcode_track_playlist and self.queue is not None:
-            for segment in segments:
-                if segment.kind != "track":
-                    continue
-                if not await self.queue.track_needs_transcode(segment.tracks[0]):
-                    transcode_track_playlist = False
-                    break
-
-        for segment_index, segment in enumerate(segments):
-            action = (
-                self._sm6_initial_queue_action(
-                    segment_kind=segment.kind,
-                    replace_transcode_queue=transcode_track_playlist,
-                )
-                if segment_index == 0
-                else sm6_action_for_enqueue("add")
-            )
-            if segment.kind == "album":
-                if not segment.parent_rating_key:
-                    raise LookupError("Album segment without parentRatingKey")
-                album_metadata = await self.plex_lib.fetch_metadata(
-                    f"/library/metadata/{segment.parent_rating_key}",
-                )
-                if album_metadata is None:
-                    raise LookupError(
-                        f"Album metadata {segment.parent_rating_key} not found",
-                    )
-                didl = await resolver.resolve_didl(album_metadata, media_kind="album")
-                logger.info(
-                    "%s SM6 QueueFolder %s album parent=%s (%s track(s))",
-                    self.dlna.name,
-                    action,
-                    segment.parent_rating_key,
-                    len(segment.tracks),
-                )
-            else:
-                track = segment.tracks[0]
-                didl, _, _ = await self._sm6_resolve_track_playback(
-                    track,
-                    resolver,
-                    paused=paused,
-                )
-            await sm6.queue_folder(
-                didl,
-                action=action,
-                server_udn=server_udn,
-            )
-            self._sm6_mark_outbound_activity(15.0)
-
-        self._sm6_enqueued_tracks = tuple(queue_tracks)
-        self._sm6_synced_tail_item_ids = tuple(
-            int(track.playQueueItemID)
-            for track in queue_tracks[1:]
-            if getattr(track, "playQueueItemID", None) is not None
+        action = self._sm6_initial_queue_action(
+            segment_kind="track",
+            replace_playlist_queue=replace_playlist_queue,
         )
         logger.info(
-            "%s SM6 queue enqueued %d track(s) via %d QueueFolder call(s)",
+            "%s SM6 playlist phase A QueueFolder action=%s ratingKey=%s",
             self.dlna.name,
-            len(queue_tracks),
-            len(segments),
+            action,
+            getattr(first_track, "ratingKey", "?"),
+        )
+        await sm6.queue_folder(
+            didl,
+            action=action,
+            server_udn=server_udn,
+        )
+        if skip_count and not paused:
+            await self._sm6_skip_to_track_unlocked(sm6, skip_count)
+
+        await self._sm6_kick_playback_timeline(
+            first_track,
+            first_url,
+            start_index=start_index,
+            offset=offset,
+            paused=paused,
         )
 
         self.current_track_info = first_track
         self._sm6_session_uri = first_url
         self._sm6_queue_base_offset = start_index
-        self.state.update(
-            state="PAUSED_PLAYBACK" if paused else "PLAYING",
-            uri=first_url,
-            position=str(timedelta(milliseconds=offset)) if offset else "0",
-        )
-        await self._sm6_after_queue_folder(offset=offset, paused=paused)
-        await self._sm6_refresh_playlist_snapshot()
+        self._sm6_enqueued_tracks = (first_track,)
         self._sm6_mark_playback_owned()
-        self._sm6_notify_plex_timeline_sync()
+        self._sm6_schedule_playlist_tail_fill(
+            offset=offset,
+            paused=paused,
+            plex_takeover=plex_takeover,
+            start_index=start_index,
+            first_track=first_track,
+            generation=self._sm6_dispatcher().current_generation(),
+        )
 
-    async def _sm6_skip_to_track(self, count: int) -> None:
-        from dlna.sm6_control import Sm6Control
+    def _sm6_schedule_playlist_tail_fill(
+        self,
+        *,
+        offset: int,
+        paused: bool,
+        plex_takeover: bool,
+        start_index: int,
+        first_track,
+        generation: int,
+    ) -> None:
+        task = self._sm6_tail_fill_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._sm6_tail_fill_task = asyncio.create_task(
+            self._sm6_playlist_tail_fill(
+                offset=offset,
+                paused=paused,
+                plex_takeover=plex_takeover,
+                start_index=start_index,
+                first_track=first_track,
+                generation=generation,
+            ),
+            name=f"sm6-tail-fill-{self.dlna.name}",
+        )
+
+    async def _sm6_playlist_tail_fill(
+        self,
+        *,
+        offset: int,
+        paused: bool,
+        plex_takeover: bool,
+        start_index: int,
+        first_track,
+        generation: int,
+    ) -> None:
+        """APPEND remaining playlist segments one SOAP job at a time (control can interleave)."""
+        from dlna.sm6_queue import sm6_action_for_enqueue
+        from plex.url_resolver import get_url_resolver
+
+        try:
+            dispatcher = self._sm6_dispatcher()
+            if dispatcher.current_generation() != generation:
+                return
+
+            resolver = get_url_resolver()
+            server_udn = await self._sm6_plex_server_udn()
+            sm6 = self._sm6_control()
+
+            tracks = await self._all_queue_tracks()
+            queue_tracks = tracks[start_index:]
+            if len(queue_tracks) <= 1:
+                self._sm6_synced_tail_item_ids = ()
+                return
+
+            segments = await self._plan_sm6_queue_segments(queue_tracks)
+            album_segments = sum(1 for segment in segments if segment.kind == "album")
+            logger.info(
+                "%s SM6 playlist tail plan: %s track(s) -> %s segment(s) "
+                "(plan had %s album container(s); APPEND is one SOAP job per track)",
+                self.dlna.name,
+                len(queue_tracks),
+                len(segments),
+                album_segments,
+            )
+
+            enqueued_keys = {str(getattr(first_track, "ratingKey", "") or "")}
+            append_count = 0
+            for segment in segments:
+                if dispatcher.current_generation() != generation:
+                    logger.info(
+                        "%s SM6 playlist tail fill aborted (generation %s -> %s)",
+                        self.dlna.name,
+                        generation,
+                        dispatcher.current_generation(),
+                    )
+                    return
+
+                tracks_to_add = [
+                    track
+                    for track in segment.tracks
+                    if str(getattr(track, "ratingKey", "") or "") not in enqueued_keys
+                ]
+                if not tracks_to_add:
+                    continue
+
+                # One dispatcher queue job per track APPEND so poll/control can interleave.
+                for track in tracks_to_add:
+                    if dispatcher.current_generation() != generation:
+                        return
+                    didl, _, _ = await self._sm6_resolve_track_playback(
+                        track,
+                        resolver,
+                        paused=paused,
+                        playlist_item=True,
+                    )
+
+                    async def _append_track(didl=didl) -> None:
+                        await sm6.queue_folder(
+                            didl,
+                            action=sm6_action_for_enqueue("add"),
+                            server_udn=server_udn,
+                        )
+
+                    await self._sm6_run_queue(
+                        _append_track,
+                        label=f"tail APPEND {getattr(track, 'ratingKey', '?')}",
+                    )
+                    enqueued_keys.add(str(getattr(track, "ratingKey", "") or ""))
+                    append_count += 1
+                    self._sm6_mark_outbound_activity(15.0)
+                    if not paused and append_count % 4 == 0:
+                        self._sm6_wake_waiters()
+
+            self._sm6_enqueued_tracks = tuple(queue_tracks)
+            self._sm6_synced_tail_item_ids = tuple(
+                int(track.playQueueItemID)
+                for track in queue_tracks[1:]
+                if getattr(track, "playQueueItemID", None) is not None
+            )
+            logger.info(
+                "%s SM6 tail enqueued %d track(s) via %d extra QueueFolder call(s)",
+                self.dlna.name,
+                len(queue_tracks),
+                append_count,
+            )
+            await self._sm6_refresh_playlist_snapshot()
+            self._sm6_wake_waiters()
+        except asyncio.CancelledError:
+            logger.debug("%s SM6 playlist tail fill cancelled", self.dlna.name)
+
+    async def _sm6_skip_to_track_unlocked(self, sm6, count: int) -> None:
         from plex.url_resolver import _SM6_ALBUM_PLAY_SKIP_SETTLE_SECONDS
 
-        sm6 = Sm6Control(self.dlna.location_url)
         for index in range(count):
             logger.info(
                 "%s SM6 skip_next %d/%d after album QueueFolder",
@@ -3696,8 +4316,36 @@ class PlexDlnaAdapter(object):
             await sm6.skip_next()
             await asyncio.sleep(_SM6_ALBUM_PLAY_SKIP_SETTLE_SECONDS)
 
+    async def _sm6_skip_to_track(self, count: int) -> None:
+        sm6 = self._sm6_control()
+        await self._sm6_skip_to_track_unlocked(sm6, count)
+
+    async def _sm6_kick_playback_timeline(
+        self,
+        track,
+        url: str,
+        *,
+        start_index: int = 0,
+        offset: int = 0,
+        paused: bool = False,
+    ) -> None:
+        """Project PLAYING + elapsed extrapolation as soon as the first queue segment lands."""
+        self.current_track_info = track
+        self._sm6_session_uri = url
+        self._sm6_queue_base_offset = start_index
+        position = str(timedelta(milliseconds=offset)) if offset else "0"
+        if paused:
+            self.state.update(state="PAUSED_PLAYBACK", uri=url, position=position)
+            return
+        self._sm6_enter_playing(
+            uri=url,
+            position=position,
+        )
+        await self._sm6_after_queue_folder(offset=offset, paused=False)
+        self._sm6_notify_plex_timeline_sync()
+
     async def _sm6_after_queue_folder(self, *, offset: int = 0, paused: bool = False) -> None:
-        """Update Plex timeline after QueueFolder PLAY_NOW (SM6 starts transport itself)."""
+        """Post-QueueFolder bookkeeping; Plex-side assume is armed at play/skip."""
         self.state.check_all_next_loop = True
         # ponytail: SM6 AVTransport Seek returns UPnPError after QueueFolder PLAY_NOW
         if offset:
@@ -3709,7 +4357,6 @@ class PlexDlnaAdapter(object):
         if paused:
             await self._sm6_pause()
             return
-        self._sm6_begin_optimistic_play()
         self._sm6_mark_outbound_activity()
 
     async def _sm6_pause(self) -> None:
@@ -3728,8 +4375,8 @@ class PlexDlnaAdapter(object):
         self._sm6_mark_playback_owned()
         self._sm6_note_playback_start()
         logger.info("%s SM6 resume via KeyPressed PLAY_PAUSE", self.dlna.name)
-        self.state.update(state="PLAYING")
-        self._sm6_begin_optimistic_play()
+        self._sm6_enter_playing()
+        self._sm6_begin_optimistic_play(elapsed_ms=int(self.state.elapsed or 0))
         self.state.check_all_next_loop = True
         self._sm6_wake_waiters()
         await self._sm6_send_key("PLAY_PAUSE")
@@ -3823,45 +4470,49 @@ class PlexDlnaAdapter(object):
             Sm6MoveTrack,
         )
 
-        if isinstance(op, Sm6ClearQueueTail):
-            logger.info(
-                "%s refreshPlayQueue SM6 DeleteAll (clear upcoming queue)",
-                self.dlna.name,
-            )
-            await sm6.clear_queue()
-            return
-        if isinstance(op, Sm6DeleteTrack):
-            logger.info(
-                "%s refreshPlayQueue SM6 DeletePlaylistTrack id=%s",
-                self.dlna.name,
-                op.sm6_track_id,
-            )
-            await sm6.delete_playlist_track(playlist_track_id=op.sm6_track_id)
-            return
-        if isinstance(op, Sm6MoveTrack):
-            logger.info(
-                "%s refreshPlayQueue SM6 MovePlaylistTrack from=%s to=%s",
-                self.dlna.name,
-                op.from_index,
-                op.to_index,
-            )
-            await sm6.move_playlist_track(from_index=op.from_index, to_index=op.to_index)
-            return
-        if isinstance(op, Sm6InsertTrack):
-            track = plex_tail_tracks[op.plex_tail_index]
-            didl = await self._sm6_resolve_track_didl(track)
-            logger.info(
-                "%s refreshPlayQueue SM6 InsertPlaylistTrack pos=%s title=%s ratingKey=%s",
-                self.dlna.name,
-                op.insert_position,
-                getattr(track, "title", "?"),
-                getattr(track, "ratingKey", "?"),
-            )
-            await sm6.insert_playlist_track(
-                insert_position=op.insert_position,
-                didl=didl,
-            )
-            self._sm6_enqueued_tracks = (*self._sm6_enqueued_tracks, track)
+        async def _run() -> None:
+            if isinstance(op, Sm6ClearQueueTail):
+                logger.info(
+                    "%s refreshPlayQueue SM6 DeleteAll (clear upcoming queue)",
+                    self.dlna.name,
+                )
+                await sm6.clear_queue()
+                return
+            if isinstance(op, Sm6DeleteTrack):
+                logger.info(
+                    "%s refreshPlayQueue SM6 DeletePlaylistTrack id=%s",
+                    self.dlna.name,
+                    op.sm6_track_id,
+                )
+                await sm6.delete_playlist_track(playlist_track_id=op.sm6_track_id)
+                return
+            if isinstance(op, Sm6MoveTrack):
+                logger.info(
+                    "%s refreshPlayQueue SM6 MovePlaylistTrack from=%s to=%s",
+                    self.dlna.name,
+                    op.from_index,
+                    op.to_index,
+                )
+                await sm6.move_playlist_track(from_index=op.from_index, to_index=op.to_index)
+                return
+            if isinstance(op, Sm6InsertTrack):
+                track = plex_tail_tracks[op.plex_tail_index]
+                didl = await self._sm6_resolve_track_didl(track)
+                logger.info(
+                    "%s refreshPlayQueue SM6 InsertPlaylistTrack pos=%s title=%s ratingKey=%s",
+                    self.dlna.name,
+                    op.insert_position,
+                    getattr(track, "title", "?"),
+                    getattr(track, "ratingKey", "?"),
+                )
+                await sm6.insert_playlist_track(
+                    insert_position=op.insert_position,
+                    didl=didl,
+                )
+                self._sm6_enqueued_tracks = (*self._sm6_enqueued_tracks, track)
+
+        label = type(op).__name__
+        await self._sm6_run_queue(_run, label=f"refresh {label}")
 
     async def _sm6_sync_queue_on_refresh(
         self,
@@ -3893,7 +4544,22 @@ class PlexDlnaAdapter(object):
         if old_tail_item_ids == new_tail_ids:
             return
 
-        from dlna.sm6_control import Sm6Control
+        try:
+            # One dispatcher queue job per SM6 edit so poll can interleave between APPENDs.
+            await self._sm6_sync_queue_on_refresh_impl(
+                old_tail_item_ids,
+                new_tail_ids,
+                new_tail_tracks,
+            )
+        except asyncio.CancelledError:
+            logger.debug("%s refreshPlayQueue tail sync coalesced/cancelled", self.dlna.name)
+
+    async def _sm6_sync_queue_on_refresh_impl(
+        self,
+        old_tail_item_ids: list[int],
+        new_tail_ids: list[int],
+        new_tail_tracks: list,
+    ) -> None:
         from plex.sm6_queue_edit import (
             Sm6ClearQueueTail,
             Sm6InsertTrack,
@@ -3902,7 +4568,7 @@ class PlexDlnaAdapter(object):
             sm6_tail_entries,
         )
 
-        sm6 = Sm6Control(self.dlna.location_url)
+        sm6 = self._sm6_control()
         await self._sm6_refresh_playlist_snapshot(fetch_tracks=True)
         state = self._sm6_playlist_snapshot
         sm6_tail = sm6_tail_entries(state)
@@ -3954,8 +4620,6 @@ class PlexDlnaAdapter(object):
             )
             for op in insert_ops:
                 await self._sm6_apply_queue_edit_op(sm6, op, plex_tail_tracks=new_tail_tracks)
-                await self._sm6_refresh_playlist_snapshot(fetch_tracks=True)
-                state = self._sm6_playlist_snapshot
         else:
             from plex.sm6_queue_edit import Sm6ClearQueueTail, Sm6InsertTrack, Sm6MoveTrack
 
@@ -3968,10 +4632,9 @@ class PlexDlnaAdapter(object):
                 )
             for op in reconcile_ops:
                 await self._sm6_apply_queue_edit_op(sm6, op, plex_tail_tracks=new_tail_tracks)
-                if isinstance(op, (Sm6InsertTrack, Sm6MoveTrack, Sm6ClearQueueTail)):
+                if isinstance(op, Sm6ClearQueueTail):
                     await self._sm6_refresh_playlist_snapshot(fetch_tracks=True)
                     state = self._sm6_playlist_snapshot
-                if isinstance(op, Sm6ClearQueueTail):
                     break
 
         self._sm6_synced_tail_item_ids = tuple(new_tail_ids)
@@ -4051,10 +4714,11 @@ class PlexDlnaAdapter(object):
             self._sm6_relinquish_control("plex_stop")
             self._sm6_sonoplay_owned_playback = False
             logger.info("%s SM6 stop — KeyPressed STOP (plex)", self.dlna.name)
-            async with self._sm6_transport_lane():
-                from dlna.sm6_control import Sm6Control
 
-                await Sm6Control(self.dlna.location_url).stop()
+            async def _run() -> None:
+                await self._sm6_control().stop()
+
+            await self._sm6_run_control(_run, label="KeyPressed STOP")
             self.state.check_all_next_loop = True
             return
         await self.dlna.Stop()
@@ -4071,12 +4735,55 @@ class PlexDlnaAdapter(object):
         self.state.update(state="PAUSED_PLAYBACK")
         self.state.check_all_next_loop = True
 
+    async def _sm6_skip_via_key(self, *, previous: bool) -> None:
+        from dlna.sm6_simple_remote import KEY_SKIP_NEXT, KEY_SKIP_PREVIOUS
+
+        key = KEY_SKIP_PREVIOUS if previous else KEY_SKIP_NEXT
+        await self._sm6_send_key(key)
+
+        if previous:
+            now = time.monotonic()
+            last = self._sm6_last_skip_previous_mono
+            self._sm6_last_skip_previous_mono = now
+            # Second Plex skipPrevious within the window → SM6 previous track.
+            if (
+                last is not None
+                and (now - last) * 1000.0 <= _SM6_PREV_SKIP_WINDOW_MS
+            ):
+                await self._sm6_bump_queue_offset(-1)
+                track = self.current_track_info
+                if track is not None:
+                    duration = getattr(track, "duration", None)
+                    if duration is not None:
+                        try:
+                            self.state.current_track_duration = int(duration)
+                        except (TypeError, ValueError):
+                            pass
+                    self._sm6_publish_track_change(track)
+        else:
+            self._sm6_last_skip_previous_mono = None
+
+        # Same track (restart) or new track: reset Plex clock with skip latency.
+        self._sm6_clear_optimistic_play()
+        self.state.disarm_elapsed_assume()
+        self._sm6_begin_optimistic_play(
+            elapsed_ms=0,
+            delay_seconds=settings.sm6_position_assume_skip_delay_seconds,
+        )
+        self._sm6_enter_playing(position="0")
+        self.state.check_all_next_loop = True
+        asyncio.create_task(self._sm6_sync_after_skip())
+
     async def prev(self):
-        if self.state.elapsed <= 5 * 1000:
+        # SM6 decides restart vs previous track from single vs double tap.
+        if self._is_sm6_renderer() and self.queue is not None:
+            mode = await self._detect_sm6_play_mode()
+            if mode in ("album", "playlist"):
+                await self._sm6_skip_via_key(previous=True)
+                return
+        elapsed_ms = self.state.elapsed
+        if elapsed_ms <= _SM6_PREV_SKIP_WINDOW_MS:
             await self.next(revert=True)
-        elif self._is_sm6_renderer():
-            async with self._sm6_transport_lane():
-                await self.seek(0)
         else:
             await self.seek(0)
 
@@ -4084,20 +4791,7 @@ class PlexDlnaAdapter(object):
         if self._is_sm6_renderer() and self.queue is not None:
             mode = await self._detect_sm6_play_mode()
             if mode in ("album", "playlist"):
-                from dlna.sm6_simple_remote import KEY_SKIP_NEXT, KEY_SKIP_PREVIOUS
-
-                if revert:
-                    await self._sm6_send_key(KEY_SKIP_PREVIOUS)
-                else:
-                    await self._sm6_send_key(KEY_SKIP_NEXT)
-                self.state.disarm_elapsed_assume()
-                self.state.update(state="TRANSITIONING", position="0")
-                self.state.arm_elapsed_assume(
-                    elapsed_ms=0,
-                    delay_seconds=settings.sm6_position_assume_skip_delay_seconds,
-                )
-                self.state.check_all_next_loop = True
-                asyncio.create_task(self._sm6_sync_after_skip())
+                await self._sm6_skip_via_key(previous=revert)
                 return
         direction = -1 if revert else 1
         current_offset = await self.queue.selected_offset()
@@ -4145,13 +4839,15 @@ class PlexDlnaAdapter(object):
         plex_offset = await self.queue.selected_offset()
         queue_index = plex_offset - self._sm6_queue_base_offset
         length = getattr(self._sm6_playlist_snapshot, "length", 0) or 0
-        from dlna.sm6_control import Sm6Control
         from dlna.sm6_playlist import sm6_set_current_playlist_track_id
         from plex.url_resolver import get_url_resolver
 
-        sm6 = Sm6Control(self.dlna.location_url)
+        sm6 = self._sm6_control()
         if length <= 0:
-            length = await sm6.get_playlist_length()
+            async def _read_length() -> int:
+                return await sm6.get_playlist_length()
+
+            length = await self._sm6_run_read(_read_length)
         if queue_index < 0 or queue_index >= length:
             return False
 
@@ -4162,7 +4858,10 @@ class PlexDlnaAdapter(object):
             entry = state.tracks[queue_index]
         sm6_track_id = sm6_set_current_playlist_track_id(queue_index, entry)
 
-        await sm6.set_current_playlist_track(sm6_track_id)
+        async def _select() -> None:
+            await sm6.set_current_playlist_track(sm6_track_id)
+
+        await self._sm6_run_transport(_select, label="SetCurrentPlaylistTrack")
         track = await self.queue.selected_track()
         self.current_track_info = track
         self._sm6_last_queue_track_id = sm6_track_id
@@ -4170,12 +4869,8 @@ class PlexDlnaAdapter(object):
             self._sm6_session_uri = await get_url_resolver().resolve_stream_url(track)
         except LookupError:
             pass
-        self.state.update(
-            state="PLAYING",
-            uri=self._sm6_session_uri,
-            position="0",
-        )
-        self.state.arm_elapsed_assume(
+        self._sm6_enter_playing(uri=self._sm6_session_uri, position="0")
+        self._sm6_begin_optimistic_play(
             elapsed_ms=0,
             delay_seconds=settings.sm6_position_assume_skip_delay_seconds,
         )
@@ -4201,14 +4896,25 @@ class PlexDlnaAdapter(object):
     async def seek(self, offset):
         # Update state immediately to reflect the seek position before DLNA device responds
         self.state.update(position=str(timedelta(milliseconds=offset)))
-        if self._is_sm6_renderer() and self.state.state == "PLAYING":
-            self.state.arm_elapsed_assume(elapsed_ms=offset)
+        if self._is_sm6_renderer():
+            # ponytail: SM6 AVTransport Seek returns UPnPError after QueueFolder
+            if self.state.state == "PLAYING" or self.state._elapsed_assume_active:
+                self._sm6_begin_optimistic_play(elapsed_ms=int(offset), delay_seconds=0)
+            self.state.check_all_next_loop = True
+            logger.debug("%s SM6 skipping Seek(%s)", self.dlna.name, offset)
+            return
         await self.dlna.Seek(str(timedelta(milliseconds=offset)))
         # Force a state check on next loop to sync with actual DLNA device position
         self.state.check_all_next_loop = True
 
     async def get_elapsed(self):
-        position_info = await self.dlna.GetPositionInfo()
+        if self._is_sm6_renderer():
+            async def _get():
+                return await self.dlna.GetPositionInfo()
+
+            position_info = await self._sm6_run_read(_get, label="GetPositionInfo")
+        else:
+            position_info = await self.dlna.GetPositionInfo()
         if position_info is None:
             return 0
         t = position_info.RelTime
@@ -4271,7 +4977,13 @@ class PlexDlnaAdapter(object):
         self.state.check_all_next_loop = True
 
     async def is_muted(self):
-        mute = await self.dlna.GetMute()
+        if self._is_sm6_renderer():
+            async def _get():
+                return await self.dlna.GetMute()
+
+            mute = await self._sm6_run_read(_get, label="GetMute")
+        else:
+            mute = await self.dlna.GetMute()
         return mute.CurrentMute
 
     def start_plex_tv_notify(self):

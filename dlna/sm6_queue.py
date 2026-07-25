@@ -37,9 +37,10 @@ def initial_sm6_queue_action(
     *,
     segment_kind: str,
     replace_transcode_queue: bool = False,
+    replace_playlist_queue: bool = False,
 ) -> str:
-    """First QueueFolder action: album container or hi-res transcode playlist clears SM6 queue."""
-    if segment_kind == "album" or replace_transcode_queue:
+    """First QueueFolder action: album container or playlist takeover clears SM6 queue."""
+    if segment_kind == "album" or replace_transcode_queue or replace_playlist_queue:
         return sm6_action_for_enqueue("replace")
     return sm6_action_for_enqueue("play")
 

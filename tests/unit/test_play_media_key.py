@@ -4,6 +4,7 @@ import asyncio
 import sys
 import types
 import pytest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 # ---------------------------------------------------------------------------
@@ -103,3 +104,63 @@ def test_play_media_skips_select_track_key_when_key_missing(play_media_adapter):
 
     play_media_adapter.queue.select_track_key.assert_not_called()
     play_media_adapter.play_selected_queue_item.assert_awaited_once_with(offset=0, paused=False)
+
+
+def test_play_media_playqueue_album_key_no_album_fallback(play_media_adapter):
+    play_media_adapter._is_sm6_renderer = lambda: True
+    play_media_adapter._sm6_begin_plex_play = MagicMock(return_value=1)
+    play_media_adapter._sm6_plex_play_epoch = 1
+    play_media_adapter._sm6_plex_play_in_progress = False
+    play_media_adapter._sm6_abort_plex_play_takeover = MagicMock()
+    play_media_adapter.queue.select_track_key = AsyncMock(return_value=False)
+    play_media_adapter.plex_lib.fetch_metadata = AsyncMock(
+        return_value=SimpleNamespace(type="album", title="Thematic Album"),
+    )
+    play_media_adapter._play_sm6_album = AsyncMock()
+
+    asyncio.run(play_media_adapter.play_media(
+        "/playQueues/456",
+        key="/library/metadata/800001",
+    ))
+
+    play_media_adapter._play_sm6_album.assert_not_called()
+    play_media_adapter.play_selected_queue_item.assert_not_called()
+    play_media_adapter._sm6_abort_plex_play_takeover.assert_called_once()
+
+
+def test_play_media_stale_epoch_skips_abort(play_media_adapter):
+    """Older playMedia finally must not abort after a newer playMedia began."""
+    play_media_adapter._is_sm6_renderer = lambda: True
+    play_media_adapter._sm6_begin_plex_play = MagicMock(return_value=1)
+    play_media_adapter._sm6_plex_play_epoch = 2
+    play_media_adapter._sm6_plex_play_in_progress = True
+    play_media_adapter._sm6_abort_plex_play_takeover = MagicMock()
+    play_media_adapter.queue.select_track_key = AsyncMock(return_value=False)
+
+    asyncio.run(play_media_adapter.play_media(
+        "/playQueues/456",
+        key="/library/metadata/800001",
+    ))
+
+    play_media_adapter._sm6_abort_plex_play_takeover.assert_not_called()
+    assert play_media_adapter._sm6_plex_play_in_progress is True
+
+
+def test_play_media_non_playqueue_album_key_still_uses_album_fallback(play_media_adapter):
+    play_media_adapter._is_sm6_renderer = lambda: True
+    play_media_adapter._sm6_begin_plex_play = MagicMock(return_value=1)
+    play_media_adapter._sm6_plex_play_epoch = 1
+    play_media_adapter._sm6_plex_play_in_progress = False
+    play_media_adapter._sm6_abort_plex_play_takeover = MagicMock()
+    play_media_adapter.queue.select_track_key = AsyncMock(return_value=False)
+    album = SimpleNamespace(type="album", title="Direct Album")
+    play_media_adapter.plex_lib.fetch_metadata = AsyncMock(return_value=album)
+    play_media_adapter._play_sm6_album = AsyncMock()
+
+    asyncio.run(play_media_adapter.play_media(
+        "/library/metadata/800001",
+        key="/library/metadata/800001",
+    ))
+
+    play_media_adapter._play_sm6_album.assert_awaited_once()
+    play_media_adapter.play_selected_queue_item.assert_not_called()
