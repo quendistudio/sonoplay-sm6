@@ -157,6 +157,31 @@ def _build_fields(**kwargs) -> str:
     return "".join(parts)
 
 
+def rewrite_sm6_rendering_control_url(control_url: str, preferred_description_url: str) -> str:
+    """Map a Plex :8050 RenderingControl URL onto a native SM6 host when available.
+
+    When preferred is still the :8050 proxy, keep the original URL intact — truncating
+    at ``/RenderingControl/`` would drop the proxy UUID path prefix and break SetVolume.
+    """
+    if not control_url or not preferred_description_url:
+        return control_url
+    if not is_sm6_proxy_url(control_url):
+        return control_url
+    # Proxy-only discovery: rewriting would strip ``/<uuid>/RenderingControl/...``.
+    if is_sm6_proxy_url(preferred_description_url):
+        return control_url
+
+    from urllib.parse import urlparse, urlunparse
+
+    pref = urlparse(preferred_description_url)
+    cur = urlparse(control_url)
+    path = cur.path or ""
+    marker = "/RenderingControl/"
+    if marker in path:
+        path = path[path.find(marker) :]
+    return urlunparse((pref.scheme or "http", pref.netloc, path, "", "", ""))
+
+
 async def _rendering_control_url(device) -> str | None:
     await device.get_data()
     service = device._get_service(UPNP_RC_SERVICE_TYPE)
@@ -164,17 +189,7 @@ async def _rendering_control_url(device) -> str | None:
         return None
     url = str(service.control_url or "")
     preferred = sm6_preferred_description_url(device)
-    if preferred and is_sm6_proxy_url(url):
-        from urllib.parse import urlparse, urlunparse
-
-        pref = urlparse(preferred)
-        cur = urlparse(url)
-        path = cur.path or ""
-        marker = "/RenderingControl/"
-        if marker in path:
-            path = path[path.find(marker) :]
-        url = urlunparse((pref.scheme or "http", pref.netloc, path, "", "", ""))
-    return url or None
+    return rewrite_sm6_rendering_control_url(url, preferred) or None
 
 
 async def _sm6_rc_post(device, action: str, **fields) -> bool:

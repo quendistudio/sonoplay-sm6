@@ -1231,6 +1231,16 @@ class PlexDlnaAdapter(object):
         """Clear Plex playQueue on the server and drop the proxy session."""
         from plex.play_queue import PlayQueue
 
+        # Stale plex_stop can be scheduled just before playMedia sets the flag;
+        # never wipe a takeover that has already claimed the adapter.
+        if reason == "plex_stop" and self._sm6_plex_play_in_progress:
+            logger.info(
+                "%s SM6 skip Plex neutral (%s) — playMedia in progress",
+                self.dlna.name,
+                reason,
+            )
+            return
+
         logger.info("%s SM6 Plex session neutral (%s)", self.dlna.name, reason)
         queue = self.queue
         play_queue_id = None
@@ -4708,6 +4718,18 @@ class PlexDlnaAdapter(object):
         # Guard against stale Plex stop commands during auto-next transition (non-SM6 only).
         if not force and self._auto_next_in_flight and not self._is_sm6_renderer():
             logger.info("%s ignoring stale stop command during auto-next transition", self.dlna.name)
+            return
+        # Plex often overlaps STOP with a new playMedia; neutral must not wipe the
+        # queue mid-takeover (AttributeError: queue.get_info on None).
+        if (
+            not force
+            and self._is_sm6_renderer()
+            and self._sm6_plex_play_in_progress
+        ):
+            logger.info(
+                "%s ignoring stop during SM6 playMedia takeover",
+                self.dlna.name,
+            )
             return
         controller = self.virtual_controller()
         if controller is not None and not force:

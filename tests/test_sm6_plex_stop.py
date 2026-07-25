@@ -97,6 +97,7 @@ def _stop_adapter(*, owned: bool, relinquished: bool) -> PlexDlnaAdapter:
     adapter._auto_next_in_flight = False
     adapter._sm6_sonoplay_owned_playback = owned
     adapter._sm6_relinquished_control = relinquished
+    adapter._sm6_plex_play_in_progress = False
     adapter.wait_state_change_events = []
     adapter._is_sm6_renderer = MagicMock(return_value=True)
     adapter.loop = None
@@ -127,3 +128,33 @@ async def test_plex_stop_reaches_sm6_after_passive_sync(owned, relinquished) -> 
     assert adapter._sm6_sonoplay_owned_playback is False
     adapter._sm6_run_control.assert_awaited_once()
     assert adapter._sm6_run_control.await_args.kwargs.get("label") == "KeyPressed STOP"
+
+
+@pytest.mark.asyncio
+async def test_plex_stop_ignored_during_playmedia_takeover() -> None:
+    adapter = _stop_adapter(owned=True, relinquished=False)
+    adapter._sm6_plex_play_in_progress = True
+    adapter.queue = MagicMock(name="play_queue")
+
+    await adapter.stop()
+
+    adapter._sm6_relinquish_control.assert_not_called()
+    adapter._sm6_run_control.assert_not_awaited()
+    assert adapter.queue is not None
+
+
+@pytest.mark.asyncio
+async def test_plex_neutral_skipped_during_playmedia_takeover() -> None:
+    adapter = _stop_adapter(owned=True, relinquished=False)
+    adapter._sm6_plex_play_in_progress = True
+    adapter.queue = MagicMock(name="play_queue")
+    adapter.plex_lib = MagicMock()
+    adapter._ensure_plex_lib_for_sm6_api = AsyncMock(return_value=True)
+    adapter._sm6_clear_plex_session_local = MagicMock()
+    adapter._sm6_wake_waiters = MagicMock()
+    adapter._sm6_notify_plex_timeline_sync = MagicMock()
+
+    await adapter._sm6_reset_plex_neutral("plex_stop")
+
+    adapter._sm6_clear_plex_session_local.assert_not_called()
+    assert adapter.queue is not None
