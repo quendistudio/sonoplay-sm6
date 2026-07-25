@@ -792,14 +792,12 @@ class DlnaState(object):
             if await self.adapter._sm6_should_skip_volume_poll():
                 poll_volume = False
         poll_muted = check_count % muted_check_count == 0 or self.check_all_next_loop
-        # Poll source until clients are detached — not gated on relinquished.
-        # device_stopped/plex_stop often fires before the next %10 cycle; gating on
-        # relinquished skipped detach entirely (Plexamp path / STOP-on-source-change).
+        # Poll source even while detached — latch must clear when SM6 returns to
+        # Media Player, otherwise Plex Windows stays on disconnected="1" forever.
         poll_audio_source = (
             sm6_renderer
             and hasattr(self.adapter, "_sm6_note_polled_audio_source")
             and (check_count % 10 == 0 or self.check_all_next_loop)
-            and not getattr(self.adapter, "_sm6_plex_clients_detached", False)
         )
         force_poll = self.check_all_next_loop
         if self.check_all_next_loop:
@@ -1638,6 +1636,17 @@ class PlexDlnaAdapter(object):
         if self._sm6_plex_clients_detached:
             if current is not None:
                 self._sm6_last_audio_source = current
+                # Idle 10→other latches disconnect; returning to Media Player must
+                # re-arm attach or Plex Windows cannot reconnect without playMedia.
+                if current == AUDIO_SOURCE_MEDIA_PLAYER:
+                    self._sm6_plex_clients_detached = False
+                    logger.info(
+                        "%s SM6 audio source %s — clearing detach latch (Media Player again)",
+                        self.dlna.name,
+                        current,
+                    )
+                    for entry in list(self.wait_state_change_events):
+                        entry["event"].set()
             return None
         previous = self._sm6_last_audio_source
         if current is not None:
@@ -1715,7 +1724,7 @@ class PlexDlnaAdapter(object):
                 except Exception as exc:
                     if __debug__:
                         logger.debug("dlna %s state poll position: %s", dlna.name, exc)
-            if poll_audio_source and not self._sm6_plex_clients_detached:
+            if poll_audio_source:
                 try:
                     from dlna.sm6_control import Sm6Control
 
@@ -3153,23 +3162,39 @@ class PlexDlnaAdapter(object):
         for entry in list(self.wait_state_change_events):
             entry["event"].set()
 
-    async def _sm6_on_plex_client_subscribe(self) -> None:
-        """Subscribe must not force Media Player — that belongs to playMedia.
+    async def _sm6_clear_plex_detach_latch(self, reason: str) -> None:
+        """Allow Plex clients to attach again without reclaiming Media Player source.
 
-        Plexamp often re-subscribes / polls after disconnected=\"1\". Ensuring source 10
-        here restarts SM6 queue playback and undoes an intentional source change.
+        Invariant (do not regress): detach may force local via disconnected=\"1\", but the
+        next intentional select/subscribe after the client has left must be able to attach.
+        Clearing this latch must never call ensure_media_player_source — only playMedia does.
         """
+        if not self._sm6_plex_clients_detached:
+            return
+        self._sm6_plex_clients_detached = False
+        logger.info(
+            "%s SM6 clearing detach latch (%s) — no Media Player reclaim",
+            self.dlna.name,
+            reason,
+        )
+        for entry in list(self.wait_state_change_events):
+            entry["event"].set()
+
+    async def _sm6_on_plex_client_subscribe(self) -> None:
+        """Re-arm attach on subscribe; never force Media Player (playMedia does that)."""
         if not self._is_sm6_renderer():
             return
-        if self._sm6_plex_clients_detached:
-            logger.info(
-                "%s SM6 Plex subscribe while detached — leaving latch (no Media Player reclaim)",
-                self.dlna.name,
-            )
+        await self._sm6_clear_plex_detach_latch("plex_subscribe")
+
+    async def _sm6_on_plex_client_unsubscribe(self) -> None:
+        """Client left (local fallback) — re-arm so the next select can attach."""
+        if not self._is_sm6_renderer():
+            return
+        await self._sm6_clear_plex_detach_latch("plex_unsubscribe")
 
     async def _sm6_poll_audio_source(self) -> None:
         """Standalone audio-source poll (tests / manual). State loop uses state-poll batch."""
-        if not self._is_sm6_renderer() or self._sm6_plex_clients_detached:
+        if not self._is_sm6_renderer():
             return
 
         try:

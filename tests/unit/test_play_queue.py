@@ -20,7 +20,15 @@ from tests.fixtures.plex_tracks import (
 def _load_play_queue_class():
     """Other unit tests stub plex.play_queue; reload the real module when needed."""
     mod = sys.modules.get("plex.play_queue")
-    if mod is None or isinstance(getattr(mod, "PlayQueue", None), MagicMock):
+    play_queue_cls = getattr(mod, "PlayQueue", None) if mod is not None else None
+    needs_reload = (
+        mod is None
+        or getattr(mod, "__file__", "").startswith("<stub")
+        or play_queue_cls is None
+        or play_queue_cls is MagicMock
+        or isinstance(play_queue_cls, MagicMock)
+    )
+    if needs_reload:
         ensure_real_plex_package()
         mod = reload_module("plex.play_queue")
     return mod.PlayQueue
@@ -224,5 +232,9 @@ class TestPlayQueueServerClear:
             assert "/playQueues/3888/items" in url
             return FakeDeleteCtx()
 
-        monkeypatch.setattr("plex.play_queue.g.http.delete", fake_delete)
+        import plex.play_queue as play_queue_mod
+
+        http = MagicMock()
+        http.delete = fake_delete
+        monkeypatch.setattr(play_queue_mod.g, "http", http)
         assert await PlayQueue.clear_server_play_queue(lib, 3888) is True

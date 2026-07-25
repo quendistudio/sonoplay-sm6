@@ -1190,6 +1190,11 @@ async def unsubscribe(request: Request,
     await guess_host_ip(request)
     sub_man.update_command_id(target_uuid, client_uuid, commandID)
     await sub_man.remove_subscriber(client_uuid, target_uuid=target_uuid)
+    device = await get_device_by_uuid(target_uuid)
+    if device is not None:
+        adapter = await adapter_by_device(device)
+        if hasattr(adapter, "_sm6_on_plex_client_unsubscribe"):
+            await adapter._sm6_on_plex_client_unsubscribe()
     return await build_response(XML_OK, target_uuid=target_uuid)
 
 

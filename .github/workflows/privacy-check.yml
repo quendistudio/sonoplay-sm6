@@ -18,6 +18,15 @@ jobs:
       - name: Scan for private deployment data
         run: python scripts/check_private_data.py
 
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Install test dependencies
         run: pip install -e ".[dev]"
 

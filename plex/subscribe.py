@@ -122,7 +122,7 @@ class SubscribeManager(object):
 
     async def remove_subscriber(self, uuid, target_uuid: str = None):
         logger.info("remove sub %s from %s", uuid, target_uuid)
-        for tu in [target_uuid] if target_uuid is not None else self.subscribers.keys():
+        for tu in [target_uuid] if target_uuid is not None else list(self.subscribers.keys()):
             l = self.subscribers.get(tu, [])
             remove = None
             for s in l:

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -11,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 SKIP_DIRS = {
     ".git",
+    ".cursor",
     ".pytest_cache",
     "__pycache__",
     "static",
@@ -70,15 +72,30 @@ ALLOW_SUBSTRINGS = (
 )
 
 
+def _git_tracked_files() -> list[Path]:
+    """Return paths tracked by git (matches what CI / a push would publish)."""
+    result = subprocess.run(
+        ["git", "-C", str(ROOT), "ls-files", "-z"],
+        check=True,
+        capture_output=True,
+    )
+    out: list[Path] = []
+    for rel in result.stdout.decode("utf-8", errors="replace").split("\0"):
+        if not rel:
+            continue
+        path = ROOT / rel
+        if path.is_file():
+            out.append(path)
+    return out
+
+
 def iter_files() -> list[Path]:
     files: list[Path] = []
-    for path in ROOT.rglob("*"):
-        if not path.is_file():
-            continue
+    for path in _git_tracked_files():
         rel = path.relative_to(ROOT).as_posix()
         if rel in SKIP_FILES:
             continue
-        if any(part in SKIP_DIRS for part in path.parts):
+        if any(part in SKIP_DIRS for part in Path(rel).parts):
             continue
         if path.suffix.lower() not in TEXT_SUFFIXES and path.name not in {".env.example"}:
             continue

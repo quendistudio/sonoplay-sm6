@@ -6,6 +6,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from tests.conftest import bare_sm6_adapter, drop_stub_modules, purge_settings_modules
+
 _STUB_MODULES = [
     "dotmap", "aiohttp", "aiohttp.ClientConnectionError",
     "xmltodict", "uvicorn",
@@ -54,10 +56,14 @@ sys.modules["plex.play_queue"].PlayQueue = MagicMock
 
 from plex.adapters import PlexDlnaAdapter  # noqa: E402
 
+# Do not leave import stubs for other test modules that need real packages.
+drop_stub_modules()
+purge_settings_modules()
+
 
 @pytest.mark.asyncio
 async def test_sm6_queue_index_moves_plex_playqueue_cursor() -> None:
-    adapter = object.__new__(PlexDlnaAdapter)
+    adapter = bare_sm6_adapter(PlexDlnaAdapter)
     adapter.dlna = MagicMock(name="SM6-test")
     adapter.queue = AsyncMock()
     adapter.queue.selected_offset = AsyncMock(return_value=0)
@@ -74,13 +80,14 @@ async def test_sm6_queue_index_moves_plex_playqueue_cursor() -> None:
     adapter.queue.select_track_key.assert_not_awaited()
     assert adapter.current_track_info.ratingKey == "100"
     assert adapter.current_track_info.playQueueItemID == 42
+    # Digit ratingKey path binds via selected_track; offset move is separate.
     adapter.queue.set_selected_offset.assert_not_awaited()
-    assert changed is True
+    assert changed is True  # plex offset 5+3=8 vs selected 0
 
 
 @pytest.mark.asyncio
 async def test_sm6_queue_sync_selects_by_rating_key_when_offset_wrong() -> None:
-    adapter = object.__new__(PlexDlnaAdapter)
+    adapter = bare_sm6_adapter(PlexDlnaAdapter)
     adapter.dlna = MagicMock(name="SM6-test")
     adapter.queue = AsyncMock()
     adapter.queue.selected_offset = AsyncMock(return_value=0)
@@ -101,7 +108,7 @@ async def test_sm6_queue_sync_selects_by_rating_key_when_offset_wrong() -> None:
 
 @pytest.mark.asyncio
 async def test_sm6_prev_uses_skip_key_for_playlist_mode(monkeypatch) -> None:
-    adapter = object.__new__(PlexDlnaAdapter)
+    adapter = bare_sm6_adapter(PlexDlnaAdapter)
     adapter.dlna = MagicMock(name="SM6-test")
     adapter.queue = MagicMock()
     adapter._is_sm6_renderer = lambda: True
@@ -116,7 +123,7 @@ async def test_sm6_prev_uses_skip_key_for_playlist_mode(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_sm6_prev_double_tap_bumps_queue(monkeypatch) -> None:
-    adapter = object.__new__(PlexDlnaAdapter)
+    adapter = bare_sm6_adapter(PlexDlnaAdapter)
     adapter.dlna = MagicMock(name="SM6-test")
     adapter.state = MagicMock()
     adapter.queue = MagicMock()
@@ -128,9 +135,12 @@ async def test_sm6_prev_double_tap_bumps_queue(monkeypatch) -> None:
     adapter._sm6_publish_track_change = MagicMock()
     adapter._sm6_enter_playing = MagicMock()
     adapter._sm6_sync_after_skip = AsyncMock()
-    monkeypatch.setattr("plex.adapters.time.monotonic", lambda: 101.0)
+    adapter._sm6_clear_optimistic_play = MagicMock()
+    adapter._sm6_begin_optimistic_play = MagicMock()
+    monkeypatch.setattr(sys.modules["plex.adapters"].time, "monotonic", lambda: 101.0)
     monkeypatch.setattr(
-        "plex.adapters.asyncio.create_task",
+        sys.modules["plex.adapters"].asyncio,
+        "create_task",
         lambda coro: (coro.close() if hasattr(coro, "close") else None) or MagicMock(),
     )
     monkeypatch.setitem(

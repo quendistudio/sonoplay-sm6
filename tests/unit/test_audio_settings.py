@@ -1,16 +1,23 @@
 import sys
 import types
-import pytest
 from unittest.mock import MagicMock
 
-# Stub out heavy transitive dependencies so we can import settings.datastore
-# in isolation without the full runtime dependency tree.
+from tests.conftest import drop_stub_modules, purge_settings_modules
+
+# Stub heavy deps; pydantic stubs let settings import in isolation.
 _STUB_MODULES = [
-    "dotmap", "aiohttp", "uvicorn",
-    "starlette", "starlette.datastructures",
-    "fastapi", "fastapi.responses", "fastapi.templating",
+    "dotmap",
+    "aiohttp",
+    "uvicorn",
+    "starlette",
+    "starlette.datastructures",
+    "fastapi",
+    "fastapi.responses",
+    "fastapi.templating",
     "fastapi.staticfiles",
-    "pydantic", "pydantic.settings", "pydantic_settings",
+    "pydantic",
+    "pydantic.settings",
+    "pydantic_settings",
     "jinja2",
 ]
 
@@ -22,17 +29,16 @@ for _name in _STUB_MODULES:
         mod.__getattr__ = lambda attr: MagicMock()
         sys.modules[_name] = mod
 
-# If a prior test stubbed 'settings' as a MagicMock, remove it so we can
-# import the real package.
-for _key in list(sys.modules):
-    if _key == "settings" or _key.startswith("settings."):
-        _mod = sys.modules[_key]
-        if isinstance(_mod, MagicMock) or not hasattr(_mod, "__file__") or (
-            hasattr(_mod, "__file__") and _mod.__file__ and "<stub" in str(_mod.__file__)
-        ):
-            del sys.modules[_key]
+purge_settings_modules()
 
-from settings.datastore import JSONDataStore
+from settings.datastore import JSONDataStore  # noqa: E402
+
+# Drop pydantic stubs but keep the settings module (needs _data_lock at runtime).
+drop_stub_modules(
+    "pydantic",
+    "pydantic.settings",
+    "pydantic_settings",
+)
 
 
 def _make_store():
@@ -44,7 +50,6 @@ def _make_store():
 def test_set_audio_settings_sample_rate_only():
     """set_audio_settings must not crash when only sample_rate_hz is provided."""
     store = _make_store()
-    # This should NOT raise TypeError
     store.set_audio_settings(sample_rate_hz=44100)
 
 

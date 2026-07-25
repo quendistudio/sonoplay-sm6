@@ -8,6 +8,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests.conftest import bare_sm6_adapter, drop_stub_modules, purge_settings_modules
+
 
 class _DotMap(dict):
     def __init__(self, *args, **kwargs):
@@ -105,6 +107,10 @@ sys.modules["starlette.datastructures"].QueryParams = MagicMock
 
 from plex.adapters import DlnaState, PlexDlnaAdapter  # noqa: E402
 
+# Do not leave import stubs for other test modules that need real packages.
+drop_stub_modules()
+purge_settings_modules()
+
 DotMap = _DotMap
 
 
@@ -121,11 +127,12 @@ def dlna_state():
 
 
 def test_continuous_extrapolation_live_between_plex_ticks(dlna_state):
-    with patch("plex.adapters.time.monotonic", side_effect=[100.0, 100.6, 100.6, 100.6, 100.6]):
+    # Stay under sm6_position_plex_notify_min_delta_ms (300) so refresh does not commit.
+    with patch("plex.adapters.time.monotonic", side_effect=[100.0, 100.2, 100.2, 100.2, 100.2]):
         dlna_state._sync_elapsed_anchor(10_000)
         dlna_state._refresh_assumed_elapsed()
         assert dlna_state.elapsed == 10_000
-        assert dlna_state.live_elapsed_ms() == 10_600
+        assert dlna_state.live_elapsed_ms() == 10_200
 
 
 def test_continuous_extrapolation_notifies_plex_on_ms_delta(dlna_state):
@@ -201,7 +208,7 @@ def test_elapsed_jump_wakes_timeline_on_one_second_tick():
 def test_begin_optimistic_play_enables_timeline_extrapolation():
     from plex.adapters import PlexDlnaAdapter
 
-    adapter = PlexDlnaAdapter.__new__(PlexDlnaAdapter)
+    adapter = bare_sm6_adapter(PlexDlnaAdapter)
     adapter.dlna = MagicMock(name="SM6")
     adapter.loop = None
     adapter._sm6_play_notify_task = None
@@ -225,7 +232,7 @@ def test_begin_optimistic_play_enables_timeline_extrapolation():
 def test_enter_playing_does_not_arm_elapsed():
     from plex.adapters import PlexDlnaAdapter
 
-    adapter = PlexDlnaAdapter.__new__(PlexDlnaAdapter)
+    adapter = bare_sm6_adapter(PlexDlnaAdapter)
     adapter.dlna = MagicMock(name="SM6")
     adapter.loop = None
     adapter._sm6_play_notify_task = None
@@ -246,7 +253,7 @@ def test_enter_playing_does_not_arm_elapsed():
 def test_begin_plex_play_arms_with_play_delay():
     from plex.adapters import PlexDlnaAdapter
 
-    adapter = PlexDlnaAdapter.__new__(PlexDlnaAdapter)
+    adapter = bare_sm6_adapter(PlexDlnaAdapter)
     adapter.dlna = MagicMock(name="SM6")
     adapter.loop = None
     adapter._sm6_play_notify_task = None
@@ -269,7 +276,7 @@ def test_begin_plex_play_arms_with_play_delay():
 def test_skip_rearms_with_skip_delay():
     from plex.adapters import PlexDlnaAdapter
 
-    adapter = PlexDlnaAdapter.__new__(PlexDlnaAdapter)
+    adapter = bare_sm6_adapter(PlexDlnaAdapter)
     adapter.dlna = MagicMock(name="SM6")
     adapter.loop = None
     adapter._sm6_play_notify_task = None
@@ -296,7 +303,7 @@ def test_accept_transport_wires_optimistic_play_not_outbound():
     """Pause masking must follow the elapsed pusher, not the outbound SOAP window."""
     from plex.adapters import PlexDlnaAdapter
 
-    adapter = PlexDlnaAdapter.__new__(PlexDlnaAdapter)
+    adapter = bare_sm6_adapter(PlexDlnaAdapter)
     adapter._sm6_outbound_until = None
     adapter._sm6_clear_optimistic_play = MagicMock()
     adapter.state = MagicMock()
@@ -318,7 +325,7 @@ def test_elapsed_pusher_runs_on_assume_without_playing_state():
     """Pusher follows assume arming, not SM6 PLAYING confirmation."""
     from plex.adapters import PlexDlnaAdapter
 
-    adapter = PlexDlnaAdapter.__new__(PlexDlnaAdapter)
+    adapter = bare_sm6_adapter(PlexDlnaAdapter)
     adapter.dlna = MagicMock(name="SM6")
     adapter.loop = None
     adapter.no_notice = True
@@ -345,7 +352,7 @@ def test_elapsed_pusher_runs_on_assume_without_playing_state():
 def test_wake_waiters_can_skip_force_poll():
     from plex.adapters import PlexDlnaAdapter
 
-    adapter = PlexDlnaAdapter.__new__(PlexDlnaAdapter)
+    adapter = bare_sm6_adapter(PlexDlnaAdapter)
     adapter.dlna = MagicMock(name="SM6")
     adapter.loop = None
     adapter.no_notice = True
@@ -359,7 +366,7 @@ def test_wake_waiters_can_skip_force_poll():
 
 
 def test_live_elapsed_extrapolates_during_transitioning():
-    adapter = PlexDlnaAdapter.__new__(PlexDlnaAdapter)
+    adapter = bare_sm6_adapter(PlexDlnaAdapter)
     adapter.dlna = MagicMock(name="SM6")
     adapter._is_sm6_renderer = lambda: True
 

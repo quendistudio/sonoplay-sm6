@@ -1,11 +1,31 @@
 """Detach must surface disconnected="1" on timeline poll, not only push notify."""
 
 import asyncio
+import importlib
+import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from plex.subscribe import TIMELINE_DISCONNECTED, TIMELINE_STOPPED, SubscribeManager, Subscriber
+from tests.conftest import (
+    drop_stub_modules,
+    ensure_real_dlna_package,
+    ensure_real_plex_package,
+    reload_module,
+)
+
+drop_stub_modules()
+ensure_real_plex_package()
+# Force a clean dlna package (empty shell modules report "unknown location").
+for _key in list(sys.modules):
+    if _key == "dlna" or _key.startswith("dlna."):
+        del sys.modules[_key]
+ensure_real_dlna_package()
+subscribe = reload_module("plex.subscribe")
+SubscribeManager = subscribe.SubscribeManager
+Subscriber = subscribe.Subscriber
+TIMELINE_DISCONNECTED = subscribe.TIMELINE_DISCONNECTED
+TIMELINE_STOPPED = subscribe.TIMELINE_STOPPED
 
 
 @pytest.mark.asyncio
@@ -27,7 +47,8 @@ async def test_msg_for_device_returns_disconnected_when_sm6_detached() -> None:
 @pytest.mark.asyncio
 async def test_timeline_poll_returns_disconnected_without_wait_when_detached() -> None:
     """Detached latch must answer poll immediately (no wait=1 / PMS notify)."""
-    from plex import plexserver
+    ensure_real_plex_package()
+    plexserver = reload_module("plex.plexserver")
 
     device = MagicMock()
     device.uuid = "device-uuid"
@@ -141,11 +162,33 @@ def test_note_polled_skips_when_already_detached() -> None:
     adapter = MagicMock(spec=PlexDlnaAdapter)
     adapter._sm6_plex_clients_detached = True
     adapter._sm6_last_audio_source = 2
+    adapter.wait_state_change_events = []
+    adapter.dlna = MagicMock(name="SM6")
     adapter._sm6_dispatcher = MagicMock()
 
     assert PlexDlnaAdapter._sm6_note_polled_audio_source(adapter, 3) is None
     adapter._sm6_dispatcher.assert_not_called()
     assert adapter._sm6_last_audio_source == 3
+    assert adapter._sm6_plex_clients_detached is True
+
+
+def test_note_polled_clears_detach_when_media_player_again() -> None:
+    """After 10→other latch, returning to Media Player must re-arm Plex attach."""
+    from plex.adapters import PlexDlnaAdapter
+
+    adapter = MagicMock(spec=PlexDlnaAdapter)
+    adapter._sm6_plex_clients_detached = True
+    adapter._sm6_last_audio_source = 2
+    adapter.wait_state_change_events = []
+    adapter.dlna = MagicMock()
+    adapter.dlna.name = "SM6"
+    waiter = {"event": MagicMock()}
+    adapter.wait_state_change_events = [waiter]
+
+    assert PlexDlnaAdapter._sm6_note_polled_audio_source(adapter, 10) is None
+    assert adapter._sm6_plex_clients_detached is False
+    assert adapter._sm6_last_audio_source == 10
+    waiter["event"].set.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -219,8 +262,8 @@ async def test_notify_device_disconnected_removes_subs_before_slow_push() -> Non
 
 
 @pytest.mark.asyncio
-async def test_sm6_on_plex_client_subscribe_does_not_reclaim_while_detached() -> None:
-    """Plexamp re-subscribe must not force source 10 (that undoes user source change)."""
+async def test_sm6_on_plex_client_subscribe_clears_latch_without_reclaim() -> None:
+    """Subscribe re-arms attach but must not force source 10."""
     from plex.adapters import PlexDlnaAdapter
 
     adapter = PlexDlnaAdapter.__new__(PlexDlnaAdapter)
@@ -232,6 +275,7 @@ async def test_sm6_on_plex_client_subscribe_does_not_reclaim_while_detached() ->
     adapter._sm6_last_audio_source = 2
     adapter._sm6_relinquished_control = True
     adapter._suppress_auto_next = True
+    adapter.wait_state_change_events = []
     adapter._sm6_run_control = AsyncMock()
 
     with patch("dlna.sm6_control.Sm6Control") as control_cls:
@@ -239,10 +283,26 @@ async def test_sm6_on_plex_client_subscribe_does_not_reclaim_while_detached() ->
         control_cls.assert_not_called()
 
     adapter._sm6_run_control.assert_not_awaited()
-    assert adapter._sm6_plex_clients_detached is True
+    assert adapter._sm6_plex_clients_detached is False
     assert adapter._sm6_relinquished_control is True
     assert adapter._sm6_last_audio_source == 2
     assert adapter._suppress_auto_next is True
+
+
+@pytest.mark.asyncio
+async def test_sm6_on_plex_client_unsubscribe_clears_latch() -> None:
+    """Unsubscribe after local fallback must re-arm the next select."""
+    from plex.adapters import PlexDlnaAdapter
+
+    adapter = PlexDlnaAdapter.__new__(PlexDlnaAdapter)
+    adapter.dlna = MagicMock()
+    adapter.dlna.name = "SM6"
+    adapter._is_sm6_renderer = lambda: True
+    adapter._sm6_plex_clients_detached = True
+    adapter.wait_state_change_events = []
+
+    await adapter._sm6_on_plex_client_unsubscribe()
+    assert adapter._sm6_plex_clients_detached is False
 
 
 @pytest.mark.asyncio
@@ -257,6 +317,7 @@ async def test_sm6_on_plex_client_subscribe_noop_when_not_detached() -> None:
     adapter._sm6_last_audio_source = 10
     adapter._sm6_relinquished_control = False
     adapter._suppress_auto_next = False
+    adapter.wait_state_change_events = []
     adapter._sm6_run_control = AsyncMock()
 
     await adapter._sm6_on_plex_client_subscribe()
