@@ -1071,19 +1071,17 @@ async def set_parameters(commandID: int,
         if volume is not None:
             from plex.plex_client import resolve_sm6_volume_for_client
 
-            if adapter._is_sm6_renderer():
-                await adapter._sm6_refresh_volume_from_device()
-                if adapter._sm6_should_ignore_volume_write(int(volume)):
-                    return await build_response("", target_uuid=target_uuid)
-            device_step = None
-            if adapter._is_sm6_renderer():
-                device_step = await adapter._sm6_read_device_step()
+            # No GetVolume before write: apply the targeted level (debounce is
+            # upstream of SetVolume). Stale-ignore uses cached state.volume.
+            if adapter._is_sm6_renderer() and adapter._sm6_should_ignore_volume_write(
+                int(volume)
+            ):
+                return await build_response("", target_uuid=target_uuid)
             plex_volume, sm6_step = resolve_sm6_volume_for_client(
                 adapter,
                 int(volume),
                 client_uuid=client_uuid,
                 product=plex_product,
-                device_step=device_step,
             )
             logger.info(
                 "setParameters volume=%s target=%s client=%s product=%r step=%s",

@@ -44,7 +44,11 @@ def resolve_sm6_volume_for_client(
     product: str | None = None,
     device_step: int | None = None,
 ) -> tuple[int, int | None]:
-    """Return (Plex volume, optional SM6 volume step) for set_volume."""
+    """Return (Plex volume, optional SM6 volume step) for set_volume.
+
+    Plexamp +/- steps use ``device_step`` when provided; otherwise the step is
+    derived from cached ``adapter.state.volume`` (no GetVolume).
+    """
     note_client_product(client_uuid, product)
     if not settings.sm6_plexamp_volume_step_enabled:
         return requested_percent, None
@@ -53,6 +57,7 @@ def resolve_sm6_volume_for_client(
 
     from dlna.sm6_volume import (
         plex_for_step,
+        plex_to_step,
         plexamp_volume_step,
     )
 
@@ -66,10 +71,11 @@ def resolve_sm6_volume_for_client(
     if not is_plexamp_client(client_uuid=client_uuid, product=product):
         return requested_percent, None
 
+    step_basis = device_step if device_step is not None else plex_to_step(int(current))
     step = plexamp_volume_step(
         int(current),
         int(requested_percent),
-        hardware_step=device_step,
+        hardware_step=step_basis,
         max_step_delta=max_delta,
     )
     if step is None:

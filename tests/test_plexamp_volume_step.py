@@ -154,6 +154,22 @@ def test_resolve_sm6_volume_only_for_plexamp(settings_stub) -> None:
     assert stepped == plex_for_step(11)
 
 
+def test_resolve_sm6_volume_derives_step_from_cache(settings_stub) -> None:
+    """No GetVolume / device_step: Plexamp +/- uses plex_to_step(state.volume)."""
+    plex_client = _load_plex_client()
+    adapter = MagicMock()
+    adapter._is_sm6_renderer.return_value = True
+    adapter.state.volume = plex_for_step(10)
+
+    stepped, stepped_step = plex_client.resolve_sm6_volume_for_client(
+        adapter,
+        plex_for_step(10) + 4,
+        product="Plexamp",
+    )
+    assert stepped_step == 11
+    assert stepped == plex_for_step(11)
+
+
 def test_resolve_sm6_volume_zero_delta_is_noop(settings_stub) -> None:
     plex_client = _load_plex_client()
     adapter = MagicMock()

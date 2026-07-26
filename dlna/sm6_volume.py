@@ -132,7 +132,8 @@ def plexamp_volume_step(
 ) -> int | None:
     """±1 volume step for Plexamp +/-; None = use absolute Plex mapping (slider drag).
 
-    Requires hardware_step from GetVolume — no perceptual curve on button presses.
+    ``hardware_step`` is the current SM6 step basis (from cache/mapping or an
+    optional caller-supplied value) — no perceptual curve on button presses.
     """
     current = int(current_percent)
     requested = int(requested_percent)

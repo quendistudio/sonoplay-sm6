@@ -1777,15 +1777,6 @@ class PlexDlnaAdapter(object):
         raw = getattr(volume, "CurrentVolume", None)
         return dlna_level_to_device(raw, volume_range)
 
-    async def _sm6_read_device_step(self) -> int | None:
-        """Current SM6 volume step from GetVolume (does not change Plex cache)."""
-        level = await self._sm6_get_device_level()
-        if level is None:
-            return None
-        from dlna.sm6_volume import device_to_step
-
-        return device_to_step(level)
-
     async def _sm6_refresh_volume_from_device(self) -> int | None:
         """Read SM6 GetVolume and update state.volume; return volume step."""
         if not self._is_sm6_renderer():

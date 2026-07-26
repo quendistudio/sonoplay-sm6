@@ -150,8 +150,8 @@ class Settings(BaseSettings):
     sm6_soap_min_interval_seconds: float = 0.3
     # Minimum threshold (ms) to wake Plex long-poll — never applied to the position value.
     sm6_position_plex_notify_min_delta_ms: int = 300
-    sm6_position_assume_play_delay_seconds: float = 0.1
-    sm6_position_assume_skip_delay_seconds: float = 0.35
+    sm6_position_assume_play_delay_seconds: float = 0.3
+    sm6_position_assume_skip_delay_seconds: float = 0.3
     sm6_position_resync_back_tolerance_ms: int = 1000
     sm6_play_timeline_push_interval_seconds: float = 0.25
     sm6_plexamp_volume_step_enabled: bool = True
