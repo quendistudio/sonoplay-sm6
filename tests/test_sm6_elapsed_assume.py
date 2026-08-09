@@ -87,9 +87,8 @@ if "plex" not in sys.modules:
 
 _settings = MagicMock()
 _settings.sm6_position_plex_notify_min_delta_ms = 300
-_settings.sm6_position_assume_play_delay_seconds = 0.1
-_settings.sm6_position_assume_skip_delay_seconds = 0.35
-_settings.sm6_position_resync_back_tolerance_ms = 1000
+_settings.sm6_position_offset_ms = -300
+_settings.sm6_position_post_http_jitter_seconds = 0.0
 _settings.sm6_play_timeline_push_interval_seconds = 0.25
 _settings.sm6_force_poll_debounce_seconds = 0.0
 sys.modules["settings"].settings = _settings
@@ -127,12 +126,12 @@ def dlna_state():
 
 
 def test_continuous_extrapolation_live_between_plex_ticks(dlna_state):
-    # Stay under sm6_position_plex_notify_min_delta_ms (300) so refresh does not commit.
-    with patch("plex.adapters.time.monotonic", side_effect=[100.0, 100.2, 100.2, 100.2, 100.2]):
+    # Stay under sm6_position_plex_notify_min_delta_ms so refresh does not commit.
+    with patch("plex.adapters.time.monotonic", side_effect=[100.0, 100.05, 100.05, 100.05, 100.05]):
         dlna_state._sync_elapsed_anchor(10_000)
         dlna_state._refresh_assumed_elapsed()
         assert dlna_state.elapsed == 10_000
-        assert dlna_state.live_elapsed_ms() == 10_200
+        assert dlna_state.live_elapsed_ms() == 10_050
 
 
 def test_continuous_extrapolation_notifies_plex_on_ms_delta(dlna_state):
@@ -152,34 +151,70 @@ def test_extrapolation_keeps_subsecond_ms_not_quantized(dlna_state):
     assert dlna_state.elapsed == 11_050
 
 
-def test_arm_elapsed_assume_waits_for_play_delay(dlna_state):
+def test_arm_elapsed_assume_respects_explicit_delay(dlna_state):
     with patch("plex.adapters.time.monotonic", side_effect=[100.0, 100.05]):
-        dlna_state._arm_elapsed_assume_impl()
+        dlna_state._arm_elapsed_assume_impl(delay_seconds=0.1)
         dlna_state._refresh_assumed_elapsed()
     assert dlna_state.elapsed == 10_000
 
 
-def test_arm_elapsed_assume_ticks_after_play_delay(dlna_state):
+def test_arm_elapsed_assume_ticks_immediately_with_zero_jitter(dlna_state):
     with patch("plex.adapters.time.monotonic", side_effect=[100.0, 101.2, 101.2]):
-        dlna_state._arm_elapsed_assume_impl()
+        dlna_state._arm_elapsed_assume_impl(delay_seconds=0)
         dlna_state._refresh_assumed_elapsed()
-    assert dlna_state.elapsed == 11_100
+    assert dlna_state.elapsed == 11_200
 
 
-def test_resync_anchors_live_ms_on_small_backward_jitter(dlna_state):
+def test_resync_applies_offset_once_on_first_in_band(dlna_state):
+    """First in-band RelTime resync anchors live+offset; flag consumed."""
     dlna_state._elapsed = 10_800
+    dlna_state._elapsed_offset_applied = False
+    with patch("plex.adapters.time.monotonic", side_effect=[100.0, 100.3, 100.3, 100.3]):
+        dlna_state._sync_elapsed_anchor(10_800)
+        # live=11100 inside [10500, 11500) → anchor 11100-300
+        dlna_state._resync_elapsed_from_sm6(10_500)
+    assert dlna_state.elapsed == 10_800
+    assert dlna_state._elapsed_anchor_ms == 10_800
+    assert dlna_state._elapsed_offset_applied is True
+
+
+def test_resync_does_not_reapply_offset_on_later_in_band(dlna_state):
+    dlna_state._elapsed = 10_800
+    dlna_state._elapsed_offset_applied = True
     with patch("plex.adapters.time.monotonic", side_effect=[100.0, 100.3, 100.3, 100.3]):
         dlna_state._sync_elapsed_anchor(10_800)
         dlna_state._resync_elapsed_from_sm6(10_500)
-    assert dlna_state.elapsed == 10_800
     assert dlna_state._elapsed_anchor_ms == 11_100
+    assert dlna_state._elapsed_offset_applied is True
 
 
-def test_resync_applies_large_backward_correction(dlna_state):
+def test_arm_resets_elapsed_offset_flag(dlna_state):
+    dlna_state._elapsed_offset_applied = True
+    with patch("plex.adapters.time.monotonic", return_value=50.0):
+        dlna_state._arm_elapsed_assume_impl(delay_seconds=0)
+    assert dlna_state._elapsed_offset_applied is False
+
+
+def test_resync_clamps_when_ahead_of_reltime_band(dlna_state):
+    """live past soap+1000 → pull back to top of band (not sticky lead)."""
     dlna_state._elapsed = 12_000
-    dlna_state._sync_elapsed_anchor(12_000)
-    dlna_state._resync_elapsed_from_sm6(10_000)
+    # sync + live (2× mono) + re-anchor
+    with patch("plex.adapters.time.monotonic", side_effect=[100.0, 100.0, 100.0, 100.0]):
+        dlna_state._sync_elapsed_anchor(12_000)
+        dlna_state._resync_elapsed_from_sm6(10_000)
+    assert dlna_state.elapsed == 10_999
+    assert dlna_state._elapsed_anchor_ms == 10_999
+    assert dlna_state._elapsed_offset_applied is False
+
+
+def test_resync_snaps_up_when_behind_reltime(dlna_state):
+    dlna_state._elapsed = 9_500
+    with patch("plex.adapters.time.monotonic", side_effect=[100.0, 100.0, 100.0, 100.0]):
+        dlna_state._sync_elapsed_anchor(9_500)
+        dlna_state._resync_elapsed_from_sm6(10_000)
     assert dlna_state.elapsed == 10_000
+    assert dlna_state._elapsed_anchor_ms == 10_000
+    assert dlna_state._elapsed_offset_applied is False
 
 
 def test_disarm_elapsed_assume_stops_extrapolation(dlna_state):
@@ -250,7 +285,7 @@ def test_enter_playing_does_not_arm_elapsed():
     adapter._sm6_begin_optimistic_play.assert_not_called()
 
 
-def test_begin_plex_play_arms_with_play_delay():
+def test_begin_plex_play_does_not_arm_timeline_yet():
     from plex.adapters import PlexDlnaAdapter
 
     adapter = bare_sm6_adapter(PlexDlnaAdapter)
@@ -261,19 +296,18 @@ def test_begin_plex_play_arms_with_play_delay():
     adapter._sm6_sonoplay_owned_playback = False
     adapter._sm6_relinquished_control = True
     adapter._sm6_mark_outbound_activity = MagicMock()
+    adapter._sm6_begin_optimistic_play = MagicMock()
 
     with patch.object(DlnaState, "start_looping"):
         adapter.state = DlnaState(adapter)
     adapter.state.update = MagicMock()
 
-    with patch("plex.adapters.time.monotonic", return_value=50.0):
-        adapter._sm6_begin_plex_play()
-    assert adapter.state._elapsed_assume_active is True
-    assert adapter.state._elapsed_anchor_mono == pytest.approx(50.0 + 0.1)
+    adapter._sm6_begin_plex_play()
+    adapter._sm6_begin_optimistic_play.assert_not_called()
     adapter.state.update.assert_called_once_with(state="TRANSITIONING")
 
 
-def test_skip_rearms_with_skip_delay():
+def test_skip_rearms_after_http_with_jitter():
     from plex.adapters import PlexDlnaAdapter
 
     adapter = bare_sm6_adapter(PlexDlnaAdapter)
@@ -290,13 +324,10 @@ def test_skip_rearms_with_skip_delay():
 
     with patch("plex.adapters.time.monotonic", return_value=200.0):
         adapter._sm6_clear_optimistic_play()
-        adapter.state.disarm_elapsed_assume()
-        adapter._sm6_begin_optimistic_play(
-            elapsed_ms=0,
-            delay_seconds=_settings.sm6_position_assume_skip_delay_seconds,
-        )
+        adapter.state._disarm_elapsed_assume_impl()
+        adapter._sm6_arm_timeline_after_http(elapsed_ms=0)
     assert adapter.state.elapsed == 0
-    assert adapter.state._elapsed_anchor_mono == pytest.approx(200.0 + 0.35)
+    assert adapter.state._elapsed_anchor_mono == pytest.approx(200.0)
 
 
 def test_accept_transport_wires_optimistic_play_not_outbound():

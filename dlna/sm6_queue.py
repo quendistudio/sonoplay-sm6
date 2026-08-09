@@ -25,6 +25,13 @@ ENQUEUE_TO_SM6_ACTION: dict[str, str] = {
     "play": "PLAY_NOW",
 }
 
+QUEUE_ACTION_PLAY_FROM_HERE = "PLAY_FROM_HERE"
+
+
+def play_from_here_extra_info(object_id: str) -> str:
+    """ExtraInfo for QueueFolder PLAY_FROM_HERE (Cambridge Connect play-from-id)."""
+    return f"play-from-id:{object_id}"
+
 
 def sm6_action_for_enqueue(enqueue: str) -> str:
     action = ENQUEUE_TO_SM6_ACTION.get(enqueue)
@@ -88,8 +95,10 @@ def build_queue_folder_body(
     action: str,
     server_udn: str,
     navigator_id: str,
+    extra_info: str = "",
 ) -> str:
     escaped_didl = xml.sax.saxutils.escape(didl)
+    escaped_extra = xml.sax.saxutils.escape(extra_info)
     return (
         '<?xml version="1.0" encoding="UTF-8"?>'
         '<s:Envelope s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/" '
@@ -100,7 +109,7 @@ def build_queue_folder_body(
         f"<ServerUDN>{xml.sax.saxutils.escape(server_udn)}</ServerUDN>"
         f"<Action>{action}</Action>"
         f"<NavigatorId>{xml.sax.saxutils.escape(navigator_id)}</NavigatorId>"
-        "<ExtraInfo></ExtraInfo>"
+        f"<ExtraInfo>{escaped_extra}</ExtraInfo>"
         "</u:QueueFolder>"
         "</s:Body></s:Envelope>"
     )

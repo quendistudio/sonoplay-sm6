@@ -1,18 +1,20 @@
 services:
-  sonoplay:
-    build: .
+  sonoplay-sm6:
+    image: sonoplay-sm6:v1.2.1-sm6.latest
+    build:
+      context: /sonoplay # Change this to the path to your SonoPlay repository
+      dockerfile: Dockerfile
     container_name: sonoplay
-    network_mode: host
     restart: unless-stopped
+    network_mode: host
     ulimits:
       nofile:
         soft: 65536
         hard: 65536
     env_file:
-      - path: .env
-        required: false
+      - /sonoplay-config/.env # Change '/sonoplay-config' to your SonoPlay configuration path
+    environment:
+      TZ: Europe/Paris
+      CONFIG_PATH: /config
     volumes:
-      - sonoplay-config:/config
-
-volumes:
-  sonoplay-config:
+      - /sonoplay-config/config:/config # Change '/sonoplay-config' to your SonoPlay configuration path

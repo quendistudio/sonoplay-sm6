@@ -75,4 +75,18 @@ def test_refresh_non_contiguous_not_play_next() -> None:
     assert plan_refresh_enqueue_actions([1, 3], selected_after=0) == ["add", "add"]
 
 
-# InsertPlaylistTrack planning lives in plex.sm6_queue_edit (see test_sm6_queue_edit.py).
+def test_play_from_here_extra_info() -> None:
+    assert sm6_queue.play_from_here_extra_info("abc123") == "play-from-id:abc123"
+    assert sm6_queue.QUEUE_ACTION_PLAY_FROM_HERE == "PLAY_FROM_HERE"
+
+
+def test_build_queue_folder_body_includes_extra_info() -> None:
+    body = sm6_queue.build_queue_folder_body(
+        didl="<DIDL/>",
+        action="PLAY_FROM_HERE",
+        server_udn="udn",
+        navigator_id="nav",
+        extra_info="play-from-id:trackoid",
+    )
+    assert "<Action>PLAY_FROM_HERE</Action>" in body
+    assert "<ExtraInfo>play-from-id:trackoid</ExtraInfo>" in body

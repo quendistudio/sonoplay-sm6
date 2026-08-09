@@ -298,6 +298,7 @@ class Sm6Control:
         action: str,
         server_udn: str,
         navigator_id: str | None = None,
+        extra_info: str = "",
     ) -> None:
         resolved = navigator_id or await self.resolve_plex_navigator_id()
         body = build_queue_folder_body(
@@ -305,12 +306,14 @@ class Sm6Control:
             action=action,
             server_udn=server_udn,
             navigator_id=resolved,
+            extra_info=extra_info,
         )
         logger.info(
-            "SM6 QueueFolder action=%s server_udn=%s navigator_id=%s",
+            "SM6 QueueFolder action=%s server_udn=%s navigator_id=%s extra_info=%r",
             action,
             server_udn,
             resolved,
+            extra_info or "",
         )
         xml = await self._post(
             reciva_radio_invoke_url(self._description_url),

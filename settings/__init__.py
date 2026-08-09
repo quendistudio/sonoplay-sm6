@@ -132,6 +132,8 @@ class Settings(BaseSettings):
     plex_music_library_key: str | None = None
     plex_dlna_musique_id: str | None = None
     plex_dlna_music_folder_id: str | None = None
+    
+    # SM6 settings
     sm6_plex_navigator_name: str | None = None
     sm6_plex_navigator_id: str | None = None
     sm6_plex_navigator_auto_register: bool = True
@@ -147,12 +149,13 @@ class Settings(BaseSettings):
     sm6_soap_backoff_max_seconds: float = 30.0
     sm6_force_poll_debounce_seconds: float = 0.25
     # Min gap between consecutive dispatcher SOAP jobs (volume/transport/queue/poll).
-    sm6_soap_min_interval_seconds: float = 0.3
+    sm6_soap_min_interval_seconds: float = 0.1
     # Minimum threshold (ms) to wake Plex long-poll — never applied to the position value.
-    sm6_position_plex_notify_min_delta_ms: int = 300
-    sm6_position_assume_play_delay_seconds: float = 0.3
-    sm6_position_assume_skip_delay_seconds: float = 0.3
-    sm6_position_resync_back_tolerance_ms: int = 1000
+    sm6_position_plex_notify_min_delta_ms: int = 100
+    # One-shot phase bias on first in-band RelTime resync (not applied every poll).
+    sm6_position_offset_ms: int = -300
+    # Optional delay after transport HTTP 200 before extrapolated timeline starts (0 = immediate).
+    sm6_position_post_http_jitter_seconds: float = 0.0
     sm6_play_timeline_push_interval_seconds: float = 0.25
     sm6_plexamp_volume_step_enabled: bool = True
     sm6_plexamp_volume_step_max_delta: int = 8

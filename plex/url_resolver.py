@@ -109,8 +109,14 @@ def build_transcode_track_didl(track, stream_url: str) -> str:
 
 
 def track_skip_count(track) -> int:
-    """Tracks to SKIP_NEXT after loading the parent album container (1-based parentIndex)."""
-    raw = getattr(track, "parentIndex", None)
+    """Tracks to SKIP_NEXT after loading the album container (1-based Plex track number).
+
+    Prefer ``index`` (track # on disc). ``parentIndex`` is the disc # in Plex JSON;
+    keep it only as a legacy fallback for older fixtures that overloaded the name.
+    """
+    raw = getattr(track, "index", None)
+    if raw is None:
+        raw = getattr(track, "parentIndex", None)
     if raw is None:
         return 0
     try:
@@ -475,6 +481,41 @@ class UrlResolver:
         )
         return didl
 
+    async def resolve_track_object_id(self, track) -> str | None:
+        """Plex DLNA object id for a track (play-from-id / cache)."""
+        rating_key = str(getattr(track, "ratingKey", "") or "")
+        if rating_key:
+            cached = self._cache.get(rating_key)
+            if cached and cached.object_id:
+                return cached.object_id
+        album_title = getattr(track, "parentTitle", None)
+        track_title = getattr(track, "title", None)
+        if not album_title or not track_title:
+            return None
+        await self._ensure_dlna_ids()
+        artist = getattr(track, "grandparentTitle", None) or album_title
+        try:
+            dlna_item = await find_track_in_album(
+                self._browser,
+                self._musique_id,
+                str(album_title),
+                str(track_title),
+                artist=str(artist) if artist else None,
+            )
+        except LookupError:
+            return None
+        if rating_key and dlna_item.object_id:
+            url = dlna_item.url or ""
+            entry = StreamCacheEntry.from_track(
+                track,
+                url,
+                object_id=dlna_item.object_id,
+            )
+            self._cache[rating_key] = entry
+            self._object_to_rating[dlna_item.object_id] = rating_key
+            await self._persist_cache()
+        return dlna_item.object_id
+
     async def resolve_play_didl(
         self,
         item,
@@ -482,8 +523,12 @@ class UrlResolver:
         media_kind: str = "track",
         start_playback: bool = True,
         prefer_track_didl: bool = False,
-    ) -> tuple[str, int]:
+    ) -> tuple[str, str | None, int]:
         """QueueFolder DIDL for SM6 playback (album container when possible).
+
+        Returns ``(didl, play_from_object_id, skip_fallback)``.
+        Prefer ``PLAY_FROM_HERE`` + ``play-from-id`` when mid-album; ``skip_fallback``
+        is only for the legacy SKIP_NEXT path if the object id is unavailable.
 
         Cambridge Connect loads ``object.container.album.musicAlbum`` for album
         playback; track-level ``musicTrack`` items use a left-aligned layout on the SM6.
@@ -491,12 +536,12 @@ class UrlResolver:
         """
         if media_kind == "album":
             didl = await self.resolve_didl(item, media_kind="album")
-            return didl, 0
+            return didl, None, 0
 
         track = item
         if prefer_track_didl:
             didl = await self.resolve_didl(track, media_kind="track")
-            return didl, 0
+            return didl, None, 0
 
         album_key = album_rating_key_from_track(track)
         if start_playback and album_key:
@@ -507,18 +552,30 @@ class UrlResolver:
                 title=getattr(track, "parentTitle", None),
                 parentTitle=getattr(track, "grandparentTitle", None),
             )
+            skip = track_skip_count(track)
             logger.info(
                 "Resolving Plex DLNA play DIDL via album container "
                 "ratingKey=%s album=%r skip=%s",
                 getattr(track, "ratingKey", "?"),
                 getattr(track, "parentTitle", "?"),
-                track_skip_count(track),
+                skip,
             )
             didl = await self.resolve_didl(album_ref, media_kind="album")
-            return didl, track_skip_count(track)
+            if skip <= 0:
+                return didl, None, 0
+            play_from_id = await self.resolve_track_object_id(track)
+            if play_from_id:
+                return didl, play_from_id, 0
+            logger.warning(
+                "PLAY_FROM_HERE unavailable (no DLNA object_id) — fallback SKIP_NEXT x%s "
+                "ratingKey=%s",
+                skip,
+                getattr(track, "ratingKey", "?"),
+            )
+            return didl, None, skip
 
         didl = await self.resolve_didl(track, media_kind="track")
-        return didl, 0
+        return didl, None, 0
 
     def _persist_cache_unlocked(self) -> None:
         if not self._cache_path:
