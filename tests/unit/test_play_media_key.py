@@ -52,7 +52,14 @@ _utils.convert_volume = MagicMock(return_value=50)
 _utils.g = MagicMock()
 _utils.pms_header = MagicMock(return_value={})
 _utils.extract_value = MagicMock()
-sys.modules["plex.play_queue"].PlayQueue = MagicMock
+def _rating_key_from_metadata_key(key: str):
+    rating_from_key = str(key).rstrip("/").rsplit("/", 1)[-1]
+    return rating_from_key if rating_from_key.isdigit() else None
+
+
+_PlayQueue = MagicMock()
+_PlayQueue._rating_key_from_metadata_key = staticmethod(_rating_key_from_metadata_key)
+sys.modules["plex.play_queue"].PlayQueue = _PlayQueue
 sys.modules["dotmap"].DotMap = MagicMock
 sys.modules["starlette.datastructures"].QueryParams = MagicMock
 
@@ -77,6 +84,11 @@ def play_media_adapter():
     queue = MagicMock()
     queue.get_info = AsyncMock()
     queue.select_track_key = AsyncMock()
+    # play_media always awaits these before key selection.
+    queue.selected_offset = AsyncMock(return_value=0)
+    queue.selected_track = AsyncMock(
+        return_value=SimpleNamespace(ratingKey="", title="?", index=None),
+    )
     adapter.plex_lib.get_queue.return_value = queue
     adapter.queue = queue
 
