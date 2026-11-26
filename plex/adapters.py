@@ -2603,7 +2603,8 @@ class PlexDlnaAdapter(object):
         )
         from plex.track_metadata_search import sm6_entry_metadata_search_allowed
 
-        uri = fallback_uri or self._sm6_session_uri or ""
+        # The session URI belongs to the current track only; never apply it to other entries.
+        uri = fallback_uri or ""
 
         # 1. ?ratingKey= query param (SonoPlay, SM6, or third-party tagger).
         query_key = rating_key_from_query_param(uri)
@@ -2977,7 +2978,11 @@ class PlexDlnaAdapter(object):
                 album_hint=last_album if not entry_album else None,
                 fallback_uri=(
                     polled_uri
-                    if polled_uri and (i == queue_index or entry.track_id == current_id)
+                    if polled_uri
+                    and (
+                        i == queue_index
+                        or (queue_index < 0 and entry.track_id == current_id)
+                    )
                     else None
                 ),
                 track_id=entry.track_id,
@@ -4837,12 +4842,23 @@ class PlexDlnaAdapter(object):
                 for track in tracks_to_add:
                     if dispatcher.current_generation() != generation:
                         return
-                    didl, _, _, _ = await self._sm6_resolve_track_playback(
-                        track,
-                        resolver,
-                        paused=paused,
-                        playlist_item=True,
-                    )
+                    try:
+                        didl, _, _, _ = await self._sm6_resolve_track_playback(
+                            track,
+                            resolver,
+                            paused=paused,
+                            playlist_item=True,
+                        )
+                    except Exception as exc:
+                        # One unresolvable track must not drop the rest of the queue.
+                        logger.warning(
+                            "%s SM6 tail skip track=%r ratingKey=%s: %s",
+                            self.dlna.name,
+                            getattr(track, "title", "?"),
+                            getattr(track, "ratingKey", "?"),
+                            exc,
+                        )
+                        continue
 
                     async def _append_track(didl=didl) -> None:
                         await sm6.queue_folder(
@@ -4877,6 +4893,8 @@ class PlexDlnaAdapter(object):
             self._sm6_wake_waiters()
         except asyncio.CancelledError:
             logger.debug("%s SM6 playlist tail fill cancelled", self.dlna.name)
+        except Exception:
+            logger.exception("%s SM6 playlist tail fill failed", self.dlna.name)
 
     async def _sm6_skip_to_track_unlocked(self, sm6, count: int) -> None:
         from plex.url_resolver import _SM6_ALBUM_PLAY_SKIP_SETTLE_SECONDS

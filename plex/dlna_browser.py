@@ -294,13 +294,29 @@ async def _find_artist_folder(browser: DlnaBrowser, by_artist_id: str, artist: s
     raise LookupError(f'Artist "{artist}" not found in Plex DLNA')
 
 
-async def _find_album_via_artist(
+_TRAILING_YEAR_RE = re.compile(r"\((\d{4})\)\s*$")
+
+
+def _rank_albums(candidates: list[DlnaItem], year) -> list[DlnaItem]:
+    """Same-title albums (self-titled, reissues): matching "(YEAR)" first, then shortest title."""
+    wanted = str(year).strip() if year else None
+
+    def _key(item: DlnaItem) -> tuple[int, int]:
+        match = _TRAILING_YEAR_RE.search(item.title)
+        year_rank = 0 if wanted and match and match.group(1) == wanted else 1
+        return year_rank, len(item.title)
+
+    return sorted(candidates, key=_key)
+
+
+async def _find_albums_via_artist(
     browser: DlnaBrowser,
     musique_id: str,
     album_title: str,
     *,
     artist: str,
-) -> DlnaItem:
+    year=None,
+) -> list[DlnaItem]:
     by_artist = await find_browse_section(browser, musique_id, *_BY_ARTIST_SECTION_TITLES)
     artist_item = await _find_artist_folder(browser, by_artist.object_id, artist)
     candidates = [
@@ -310,9 +326,7 @@ async def _find_album_via_artist(
     ]
     if not candidates:
         raise LookupError(f'Album "{album_title}" not found under artist "{artist}"')
-    if len(candidates) == 1:
-        return candidates[0]
-    return min(candidates, key=lambda item: len(item.title))
+    return _rank_albums(candidates, year)
 
 
 async def find_album(
@@ -321,21 +335,36 @@ async def find_album(
     album_title: str,
     *,
     artist: str | None = None,
+    year=None,
 ) -> DlnaItem:
+    return (await find_albums(browser, musique_id, album_title, artist=artist, year=year))[0]
+
+
+async def find_albums(
+    browser: DlnaBrowser,
+    musique_id: str,
+    album_title: str,
+    *,
+    artist: str | None = None,
+    year=None,
+) -> list[DlnaItem]:
+    """All DLNA albums matching *album_title*, best candidate first."""
     if artist:
         try:
-            item = await _find_album_via_artist(
+            items = await _find_albums_via_artist(
                 browser,
                 musique_id,
                 album_title,
                 artist=artist,
+                year=year,
             )
             logger.info(
-                'Plex DLNA album via artist path: %r (artist=%r)',
-                item.title,
+                'Plex DLNA album via artist path: %r (artist=%r, candidates=%d)',
+                items[0].title,
                 artist,
+                len(items),
             )
-            return item
+            return items
         except Exception as exc:
             logger.warning(
                 "Plex DLNA artist browse path failed for %r / %r: %s",
@@ -352,13 +381,11 @@ async def find_album(
     ]
     if not candidates:
         raise LookupError(f'Album "{album_title}" not found in Plex DLNA')
+    ranked = _rank_albums(candidates, year)
     if artist:
-        for item in candidates:
-            if item.title.casefold().startswith(artist.casefold() + " - "):
-                return item
-    if len(candidates) == 1:
-        return candidates[0]
-    return min(candidates, key=lambda item: len(item.title))
+        prefix = artist.casefold() + " - "
+        ranked.sort(key=lambda item: 0 if item.title.casefold().startswith(prefix) else 1)
+    return ranked
 
 
 async def browse_album_tracks(
@@ -367,9 +394,23 @@ async def browse_album_tracks(
     album_title: str,
     *,
     artist: str | None = None,
+    year=None,
+    track_title: str | None = None,
 ) -> list[DlnaItem]:
-    album = await find_album(browser, musique_id, album_title, artist=artist)
-    return [i for i in await browser.browse(album.object_id, count=200) if not i.is_container and i.url]
+    """Tracks of the best album; with *track_title*, the first same-title album holding it."""
+    albums = await find_albums(browser, musique_id, album_title, artist=artist, year=year)
+    first: list[DlnaItem] | None = None
+    target = track_title.casefold() if track_title else None
+    for album in albums:
+        items = [
+            i for i in await browser.browse(album.object_id, count=200)
+            if not i.is_container and i.url
+        ]
+        if target is None or any(i.title.casefold() == target for i in items):
+            return items
+        if first is None:
+            first = items
+    return first or []
 
 
 async def find_track_in_album(

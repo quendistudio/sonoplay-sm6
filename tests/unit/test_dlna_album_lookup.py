@@ -8,6 +8,7 @@ from plex.dlna_browser import (
     DlnaItem,
     _artist_folder_matches,
     album_title_matches,
+    browse_album_tracks,
     discover_plex_dlna_music_ids,
     find_album,
     find_browse_section,
@@ -93,6 +94,51 @@ async def test_find_album_falls_back_when_artist_browse_raises():
         artist="Portishead",
     )
     assert item.object_id == "album-third"
+
+
+def _self_titled_tree():
+    track = "http://plex.example:32469/object/{}/file.flac"
+    return {
+        "musique": [DlnaItem("all-artists", "All Artists", True)],
+        "all-artists": [DlnaItem("artist-weezer", "Weezer", True)],
+        "artist-weezer": [
+            DlnaItem("green", "Weezer (2001)", True),
+            DlnaItem("blue", "Weezer (1994)", True),
+        ],
+        "green": [DlnaItem("g1", "Hash Pipe", False, track.format("g1"))],
+        "blue": [
+            DlnaItem("b1", "My Name Is Jonas", False, track.format("b1")),
+            DlnaItem("b2", "Buddy Holly", False, track.format("b2")),
+        ],
+    }
+
+
+class _TreeBrowser:
+    def __init__(self, tree):
+        self.tree = tree
+
+    async def browse(self, object_id: str, *, count: int = 200):
+        return self.tree.get(object_id, [])
+
+
+@pytest.mark.asyncio
+async def test_same_title_albums_prefer_matching_year():
+    item = await find_album(
+        _TreeBrowser(_self_titled_tree()), "musique", "Weezer", artist="Weezer", year=1994
+    )
+    assert item.object_id == "blue"
+
+
+@pytest.mark.asyncio
+async def test_same_title_albums_fall_through_to_album_holding_track():
+    items = await browse_album_tracks(
+        _TreeBrowser(_self_titled_tree()),
+        "musique",
+        "Weezer",
+        artist="Weezer",
+        track_title="Buddy Holly",
+    )
+    assert [i.object_id for i in items] == ["b1", "b2"]
 
 
 @pytest.mark.asyncio

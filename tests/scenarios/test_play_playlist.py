@@ -41,6 +41,30 @@ async def test_plex_queue_not_realigned_on_partial_sm6_playlist(sm6_adapter, mon
 
 
 @pytest.mark.asyncio
+async def test_unresolvable_track_skipped_rest_of_queue_appended(sm6_adapter, monkeypatch):
+    tracks = make_album_tracks(count=2, parent_key="900100") + make_album_tracks(
+        count=3, start_key=900011, album="Other Album", parent_key="900200"
+    )
+    attach_queue(sm6_adapter, tracks=tracks, container_key="/playQueues/31")
+    resolve_ok = sm6_adapter._sm6_resolve_track_playback
+    broken_key = tracks[2].ratingKey
+
+    async def _resolve(track, resolver, **kwargs):
+        if track.ratingKey == broken_key:
+            raise LookupError("track not found in DLNA album")
+        return await resolve_ok(track, resolver, **kwargs)
+
+    monkeypatch.setattr(sm6_adapter, "_sm6_resolve_track_playback", _resolve)
+
+    await sm6_adapter.play_media("/playQueues/31", key=tracks[0].key, offset=0)
+    await asyncio.wait_for(sm6_adapter._sm6_tail_fill_task, timeout=5)
+
+    actions = [e.action for e in sm6_adapter._fake_sm6.journal if e.label == "QueueFolder"]
+    assert actions[1:] == ["APPEND"] * 3
+    assert len(sm6_adapter._fake_sm6.playlist) == 4
+
+
+@pytest.mark.asyncio
 async def test_rebuild_refused_while_tail_fill_builds(sm6_adapter):
     tracks = make_album_tracks(count=1)
     attach_queue(sm6_adapter, tracks=tracks)

@@ -60,7 +60,7 @@ async def sm6_adapter(fake_sm6, monkeypatch, temp_data_dir, settings_override):
     async def _refresh(*, fetch_tracks: bool = True):
         return None
 
-    async def _after(*, offset: int = 0, paused: bool = False):
+    async def _after(*, offset: int = 0, paused: bool = False, realign: bool = True):
         return None
 
     monkeypatch.setattr(adapter, "_ensure_sm6_ready", _ready)

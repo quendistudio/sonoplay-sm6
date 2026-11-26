@@ -232,6 +232,8 @@ class UrlResolver:
             self._musique_id,
             album_title,
             artist=artist,
+            year=getattr(track, "parentYear", None),
+            track_title=str(title),
         )
         target = str(title).casefold()
         matches = [i for i in album_items if i.title.casefold() == target and i.url]
@@ -492,6 +494,7 @@ class UrlResolver:
                     self._musique_id,
                     str(album_title),
                     artist=str(artist) if artist else None,
+                    year=getattr(item, "year", None),
                 )
                 album_object_id = dlna_item.object_id
             except Exception as exc:
