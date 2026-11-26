@@ -1,19 +1,6 @@
 """Tests for DLNA SOAP exponential backoff."""
 
-import importlib.util
-import sys
-from pathlib import Path
-
-_root = Path(__file__).resolve().parents[2]
-_spec = importlib.util.spec_from_file_location(
-    "dlna.soap_backoff",
-    _root / "dlna" / "soap_backoff.py",
-)
-soap_backoff = importlib.util.module_from_spec(_spec)
-sys.modules["dlna.soap_backoff"] = soap_backoff
-assert _spec.loader is not None
-_spec.loader.exec_module(soap_backoff)
-soap_backoff_seconds = soap_backoff.soap_backoff_seconds
+from dlna.soap_backoff import soap_backoff_seconds
 
 
 def test_soap_backoff_zero_when_no_failures() -> None:

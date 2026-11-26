@@ -1,7 +1,5 @@
 """Unit tests for transcode URL signing."""
 
-import time
-
 import pytest
 
 from plex.transcode_auth import (
@@ -13,8 +11,8 @@ from plex.transcode_auth import (
 @pytest.fixture
 def paired_device(monkeypatch):
     monkeypatch.setattr(
-        "plex.transcode_auth.settings.get_token_for_uuid",
-        lambda uuid: "test-plex-token-abc" if uuid == "device-uuid-1" else None,
+        "settings.Settings.get_token_for_uuid",
+        lambda self, uuid: "test-plex-token-abc" if uuid == "device-uuid-1" else None,
     )
     monkeypatch.setattr(
         "plex.transcode_auth._device_is_registered_sm6",

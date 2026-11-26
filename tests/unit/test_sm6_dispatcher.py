@@ -2,32 +2,16 @@
 from __future__ import annotations
 
 import asyncio
-import importlib.util
-import sys
-import types
-from pathlib import Path
 
 import pytest
 
-_root = Path(__file__).resolve().parents[2]
-if str(_root) not in sys.path:
-    sys.path.insert(0, str(_root))
+from dlna import sm6_dispatcher as module
+from dlna.sm6_dispatcher import Sm6InstructionDispatcher
 
-sys.modules["settings"] = types.SimpleNamespace(
-    settings=types.SimpleNamespace(
-        sm6_soap_min_interval_seconds=0.0,
-    )
-)
 
-_spec = importlib.util.spec_from_file_location(
-    "dlna.sm6_dispatcher", _root / "dlna" / "sm6_dispatcher.py"
-)
-module = importlib.util.module_from_spec(_spec)
-assert _spec.loader is not None
-sys.modules["dlna.sm6_dispatcher"] = module
-_spec.loader.exec_module(module)
-
-Sm6InstructionDispatcher = module.Sm6InstructionDispatcher
+@pytest.fixture(autouse=True)
+def _fast_soap(settings_override):
+    settings_override(sm6_soap_min_interval_seconds=0.0)
 
 
 @pytest.mark.asyncio
@@ -275,3 +259,86 @@ async def test_drain_pending_queue_items_on_generation_bump() -> None:
     dispatcher.bump_generation()
     await item.done.wait()
     assert isinstance(item.error, asyncio.CancelledError)
+
+
+@pytest.mark.asyncio
+async def test_transport_preempt_truncates_running_poll_batch() -> None:
+    dispatcher = Sm6InstructionDispatcher("uuid-poll-preempt", "http://sm6/desc.xml")
+    order: list[str] = []
+    poll_step1 = asyncio.Event()
+
+    async def poll_job() -> None:
+        order.append("poll-soap-1")
+        poll_step1.set()
+        await asyncio.sleep(0.05)
+        if dispatcher.poll_preempt_requested():
+            order.append("poll-truncated")
+            return
+        order.append("poll-soap-2")
+
+    async def transport_job() -> None:
+        order.append("transport")
+
+    poll_task = asyncio.create_task(
+        dispatcher.submit_poll(poll_job, label="state-poll", wait=True)
+    )
+    await poll_step1.wait()
+    transport_task = asyncio.create_task(
+        dispatcher.submit_transport(
+            transport_job,
+            label="play album",
+            preempts_queue=True,
+            wait=True,
+        )
+    )
+    await asyncio.gather(poll_task, transport_task)
+    assert "poll-truncated" in order
+    assert "poll-soap-2" not in order
+    assert "transport" in order
+
+
+@pytest.mark.asyncio
+async def test_state_poll_coalesce_key_replaces_pending_poll() -> None:
+    dispatcher = Sm6InstructionDispatcher("uuid-coalesce", "http://sm6/desc.xml")
+    hold = asyncio.Event()
+    started = asyncio.Event()
+    order: list[str] = []
+
+    async def blocker() -> None:
+        order.append("block")
+        started.set()
+        await hold.wait()
+
+    async def first_poll() -> None:
+        order.append("poll-old")
+
+    async def second_poll() -> None:
+        order.append("poll-new")
+
+    block_task = asyncio.create_task(
+        dispatcher.submit_control(blocker, label="block", wait=True)
+    )
+    await started.wait()
+    old_poll = asyncio.create_task(
+        dispatcher.submit_poll(
+            first_poll,
+            label="state-poll",
+            coalesce_key="state-poll",
+            wait=True,
+        )
+    )
+    await asyncio.sleep(0)
+    new_poll = asyncio.create_task(
+        dispatcher.submit_poll(
+            second_poll,
+            label="state-poll",
+            coalesce_key="state-poll",
+            wait=True,
+        )
+    )
+    await asyncio.sleep(0.01)
+    hold.set()
+    with pytest.raises(asyncio.CancelledError):
+        await old_poll
+    await asyncio.gather(block_task, new_poll)
+    assert order == ["block", "poll-new"]

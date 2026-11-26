@@ -145,6 +145,10 @@ class Settings(BaseSettings):
     sm6_poll_volume_every_cycles: int = 4
     sm6_poll_mute_every_cycles: int = 4
     sm6_poll_playlist_every_cycles: int = 4
+    # Deep idle (STOPPED, no access 90s): transport-only SOAP when True.
+    sm6_poll_idle_transport_only: bool = True
+    # SM6 often needs attempt 2 after Server disconnected; keep retry, shorten gap.
+    sm6_soap_retry_delay_seconds: float = 0.05
     sm6_soap_backoff_base_seconds: float = 0.5
     sm6_soap_backoff_max_seconds: float = 30.0
     sm6_force_poll_debounce_seconds: float = 0.25

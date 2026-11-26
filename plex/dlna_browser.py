@@ -1,6 +1,7 @@
 """Browse Plex DLNA ContentDirectory (Plex media server DLNA endpoint)."""
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import logging
@@ -8,6 +9,8 @@ import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
+
+from aiohttp import ClientResponseError
 
 from utils import g
 
@@ -24,6 +27,9 @@ SOAP_HEADERS = {
     "SOAPAction": '"urn:schemas-upnp-org:service:ContentDirectory:1#Browse"',
 }
 
+_BROWSE_MAX_RETRIES = 3
+_BROWSE_RETRY_BASE_DELAY_SECONDS = 0.4
+
 
 @dataclass(frozen=True)
 class DlnaItem:
@@ -39,6 +45,7 @@ class DlnaBrowser:
         self._device_url = device_url
         self._timeout = timeout
         self._control_url: str | None = None
+        self._soap_lock = asyncio.Lock()
 
     async def _ensure_control_url(self) -> str:
         if self._control_url:
@@ -57,6 +64,39 @@ class DlnaBrowser:
             return self._control_url
         raise RuntimeError("ContentDirectory not found in DeviceDescription.xml")
 
+    async def _browse_soap(self, body: str, *, object_id: str) -> str:
+        async with self._soap_lock:
+            control = await self._ensure_control_url()
+            last_exc: ClientResponseError | None = None
+            for attempt in range(_BROWSE_MAX_RETRIES):
+                try:
+                    async with g.http.post(
+                        control,
+                        data=body,
+                        headers=SOAP_HEADERS,
+                        timeout=self._timeout,
+                    ) as response:
+                        response.raise_for_status()
+                        return await response.text()
+                except ClientResponseError as exc:
+                    last_exc = exc
+                    if exc.status >= 500 and attempt < _BROWSE_MAX_RETRIES - 1:
+                        delay = _BROWSE_RETRY_BASE_DELAY_SECONDS * (attempt + 1)
+                        logger.warning(
+                            "Plex DLNA browse object_id=%s HTTP %s (attempt %s/%s), retry in %.1fs",
+                            object_id,
+                            exc.status,
+                            attempt + 1,
+                            _BROWSE_MAX_RETRIES,
+                            delay,
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    raise
+            if last_exc is not None:
+                raise last_exc
+            raise RuntimeError("Plex DLNA browse failed without response")
+
     async def browse(self, object_id: str = "0", *, count: int = 200) -> list[DlnaItem]:
         body = f"""<?xml version="1.0" encoding="utf-8"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
@@ -71,10 +111,7 @@ class DlnaBrowser:
     </u:Browse>
   </s:Body>
 </s:Envelope>"""
-        control = await self._ensure_control_url()
-        async with g.http.post(control, data=body, headers=SOAP_HEADERS, timeout=self._timeout) as response:
-            response.raise_for_status()
-            text = await response.text()
+        text = await self._browse_soap(body, object_id=object_id)
         return _parse_browse_result(text)
 
     async def browse_object_didl(self, object_id: str) -> str:
@@ -92,10 +129,7 @@ class DlnaBrowser:
     </u:Browse>
   </s:Body>
 </s:Envelope>"""
-        control = await self._ensure_control_url()
-        async with g.http.post(control, data=body, headers=SOAP_HEADERS, timeout=self._timeout) as response:
-            response.raise_for_status()
-            text = await response.text()
+        text = await self._browse_soap(body, object_id=object_id)
         return _extract_browse_result_didl(text)
 
 
@@ -105,6 +139,23 @@ def _extract_browse_result_didl(soap_xml: str) -> str:
         if element.tag.endswith("Result") and element.text:
             return html.unescape(element.text.strip())
     raise LookupError("BrowseMetadata response missing Result DIDL")
+
+
+def parent_id_from_didl(didl: str) -> str | None:
+    """Album container object id from a track BrowseMetadata DIDL (``parentID``)."""
+    try:
+        root = ET.fromstring(didl)
+    except ET.ParseError:
+        match = re.search(r'\bparentID="([^"]+)"', didl)
+        return match.group(1) if match and match.group(1) != "0" else None
+    for node in root.iter():
+        tag = node.tag.rsplit("}", 1)[-1]
+        if tag not in ("item", "container"):
+            continue
+        parent_id = node.attrib.get("parentID")
+        if parent_id and parent_id != "0":
+            return parent_id
+    return None
 
 
 def _parse_browse_result(soap_xml: str) -> list[DlnaItem]:
@@ -205,7 +256,14 @@ async def child_by_title(browser: DlnaBrowser, object_id: str, title: str, *, co
 
 
 _BY_ALBUM_SECTION_TITLES = ("By Album", "Par album", "Par Album")
-_BY_ARTIST_SECTION_TITLES = ("By Artist", "Par Artiste", "Par artiste")
+_BY_ARTIST_SECTION_TITLES = (
+    "By Artist",
+    "All Artists",
+    "Par Artiste",
+    "Par artiste",
+    "Tous les artistes",
+)
+_MUSIQUE_SECTION_BROWSE_COUNT = 50
 
 
 async def find_browse_section(
@@ -215,7 +273,7 @@ async def find_browse_section(
 ) -> DlnaItem:
     """Find a Plex DLNA browse section (By Album, By Artist, …)."""
     aliases = {title.casefold() for title in title_aliases}
-    for item in await browser.browse(musique_id, count=200):
+    for item in await browser.browse(musique_id, count=_MUSIQUE_SECTION_BROWSE_COUNT):
         if item.title.casefold() in aliases:
             return item
     raise LookupError(f"Section {title_aliases!r} not found under {musique_id}")
@@ -278,8 +336,8 @@ async def find_album(
                 artist,
             )
             return item
-        except LookupError as exc:
-            logger.debug(
+        except Exception as exc:
+            logger.warning(
                 "Plex DLNA artist browse path failed for %r / %r: %s",
                 artist,
                 album_title,
@@ -430,7 +488,8 @@ async def find_items_by_title(
 
 
 _BY_ALBUM_CHILD_TITLES = frozenset({"by album", "par album"})
-_MUSIC_FOLDER_CHILD_TITLES = frozenset({"musique", "music"})
+_MUSIC_ROOT_TITLES = frozenset({"music"})
+_MUSIQUE_LIBRARY_TITLES = frozenset({"musique"})
 
 
 async def discover_plex_dlna_music_ids(
@@ -454,8 +513,14 @@ async def discover_plex_dlna_music_ids(
         child_names = {item.title.casefold() for item in children if item.is_container}
         if musique_id is None and child_names & _BY_ALBUM_CHILD_TITLES:
             musique_id = object_id
-        if music_folder_id is None and child_names & _MUSIC_FOLDER_CHILD_TITLES:
-            music_folder_id = object_id
+        for item in children:
+            if not item.is_container:
+                continue
+            title_cf = item.title.casefold()
+            if music_folder_id is None and object_id == "0" and title_cf in _MUSIC_ROOT_TITLES:
+                music_folder_id = item.object_id
+            if musique_id is None and title_cf in _MUSIQUE_LIBRARY_TITLES:
+                musique_id = item.object_id
         for item in children:
             if item.is_container:
                 await scan(item.object_id, depth + 1)

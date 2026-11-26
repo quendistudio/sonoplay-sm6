@@ -17,6 +17,7 @@ from .dlna_browser import (
     find_items_by_title,
     find_track_in_album,
     load_dlna_discovery_cache,
+    parent_id_from_didl,
     save_dlna_discovery_cache,
 )
 from .dlna_stream_cache import (
@@ -205,6 +206,23 @@ class UrlResolver:
             self._persist_cache_unlocked()
         return url
 
+    async def _drop_cached_stream(
+        self,
+        rating_key: str,
+        *,
+        object_id: str | None = None,
+    ) -> None:
+        """Drop a stale DLNA stream cache entry (invalid object_id / BrowseMetadata 500)."""
+        async with self._cache_lock:
+            entry = self._cache.pop(rating_key, None)
+            if entry and entry.object_id:
+                self._object_to_rating.pop(entry.object_id, None)
+            if object_id:
+                mapped = self._object_to_rating.pop(object_id, None)
+                if mapped:
+                    self._cache.pop(mapped, None)
+            self._persist_cache_unlocked()
+
     async def _pick_album_track(self, track, album_title: str, artist: str | None):
         title = getattr(track, "title", None)
         if not title:
@@ -326,11 +344,20 @@ class UrlResolver:
         artist = getattr(track, "grandparentTitle", None) or album_title
 
         if album_title and title:
-            item = await self._pick_album_track(
-                track,
-                str(album_title),
-                str(artist) if artist else None,
-            )
+            item = None
+            try:
+                item = await self._pick_album_track(
+                    track,
+                    str(album_title),
+                    str(artist) if artist else None,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "DLNA album track pick failed for %r / %r: %s",
+                    album_title,
+                    title,
+                    exc,
+                )
             if item and item.url:
                 return await self._store_stream(track, item)
 
@@ -402,7 +429,42 @@ class UrlResolver:
             return didl
         return patch_didl_res_urls(didl, mapping)
 
-    async def resolve_didl(self, item, *, media_kind: str = "track") -> str:
+    async def _resolve_album_object_id_via_track(self, track) -> str | None:
+        """Album container object id via a track stream URL + BrowseMetadata parentID."""
+        rating_key = str(getattr(track, "ratingKey", "") or "")
+        if rating_key:
+            cached = self._cache.get(rating_key)
+            track_object_id = cached.object_id if cached and cached.object_id else None
+        else:
+            track_object_id = None
+        if not track_object_id:
+            try:
+                stream_url = await self.resolve_stream_url(track)
+            except LookupError:
+                return None
+            track_object_id = object_id_from_stream_url(stream_url)
+        if not track_object_id:
+            return None
+        try:
+            track_didl = await self._browser.browse_object_didl(track_object_id)
+        except Exception as exc:
+            logger.warning(
+                "Plex DLNA track BrowseMetadata failed object_id=%s: %s",
+                track_object_id,
+                exc,
+            )
+            if rating_key:
+                await self._drop_cached_stream(rating_key, object_id=track_object_id)
+            return None
+        return parent_id_from_didl(track_didl)
+
+    async def resolve_didl(
+        self,
+        item,
+        *,
+        media_kind: str = "track",
+        track_hint=None,
+    ) -> str:
         """Plex DLNA DIDL for SM6 QueueFolder (album or track)."""
         await self._ensure_dlna_ids()
         if media_kind == "album":
@@ -422,20 +484,44 @@ class UrlResolver:
                 album_title,
                 artist,
             )
-            dlna_item = await find_album(
-                self._browser,
-                self._musique_id,
-                str(album_title),
-                artist=str(artist) if artist else None,
-            )
-            didl = await self._browser.browse_object_didl(dlna_item.object_id)
+            album_object_id: str | None = None
+            find_album_error: Exception | None = None
+            try:
+                dlna_item = await find_album(
+                    self._browser,
+                    self._musique_id,
+                    str(album_title),
+                    artist=str(artist) if artist else None,
+                )
+                album_object_id = dlna_item.object_id
+            except Exception as exc:
+                find_album_error = exc
+                logger.warning(
+                    "Plex DLNA find_album failed for %r (ratingKey=%s): %s",
+                    album_title,
+                    rating_key,
+                    exc,
+                )
+            if not album_object_id and track_hint is not None:
+                album_object_id = await self._resolve_album_object_id_via_track(track_hint)
+                if album_object_id:
+                    logger.info(
+                        "Plex DLNA album object_id via track hint ratingKey=%s -> %s",
+                        getattr(track_hint, "ratingKey", "?"),
+                        album_object_id,
+                    )
+            if not album_object_id:
+                if find_album_error is not None:
+                    raise find_album_error
+                raise LookupError(f"Plex DLNA album not found for {album_title!r}")
+            didl = await self._browser.browse_object_didl(album_object_id)
             self._didl_cache[cache_key] = didl
             await self._persist_cache()
             logger.info(
                 "Resolved Plex DLNA album DIDL for %s (ratingKey=%s, object_id=%s)",
                 album_title,
                 rating_key,
-                dlna_item.object_id,
+                album_object_id,
             )
             return didl
 

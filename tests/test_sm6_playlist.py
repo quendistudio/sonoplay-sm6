@@ -1,38 +1,16 @@
 """Tests SM6 queue read SOAP parsers."""
 
-import importlib.util
-import sys
-import types
-from pathlib import Path
-
-_root = Path(__file__).resolve().parents[1]
-if str(_root) not in sys.path:
-    sys.path.insert(0, str(_root))
-
-_dlna_pkg = types.ModuleType("dlna")
-_dlna_pkg.__path__ = [str(_root / "dlna")]
-sys.modules.setdefault("dlna", _dlna_pkg)
-_sm6_queue_stub = types.ModuleType("dlna.sm6_queue")
-_sm6_queue_stub.reciva_radio_invoke_url = lambda description_url: description_url
-sys.modules["dlna.sm6_queue"] = _sm6_queue_stub
-
-_spec = importlib.util.spec_from_file_location(
-    "dlna.sm6_playlist",
-    _root / "dlna" / "sm6_playlist.py",
+from dlna.sm6_playlist import (
+    SET_CURRENT_PLAYLIST_TRACK_ACTION,
+    Sm6PlaylistEntry,
+    build_set_current_playlist_track_body,
+    parse_current_playlist_track_id,
+    parse_media_queue_index,
+    parse_playlist_length,
+    parse_playlist_track_details,
+    sm6_set_current_playlist_track_id,
 )
-sm6_playlist = importlib.util.module_from_spec(_spec)
-sys.modules["dlna.sm6_playlist"] = sm6_playlist
-assert _spec.loader is not None
-_spec.loader.exec_module(sm6_playlist)
 
-parse_current_playlist_track_id = sm6_playlist.parse_current_playlist_track_id
-parse_media_queue_index = sm6_playlist.parse_media_queue_index
-parse_playlist_length = sm6_playlist.parse_playlist_length
-parse_playlist_track_details = sm6_playlist.parse_playlist_track_details
-sm6_set_current_playlist_track_id = sm6_playlist.sm6_set_current_playlist_track_id
-Sm6PlaylistEntry = sm6_playlist.Sm6PlaylistEntry
-
-# Synthetic SOAP fixture (structure only — fictional track metadata)
 PLAYLIST_TRACK_DETAILS_RESPONSE = """<?xml version="1.0" ?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><r:GetPlaylistTrackDetailsResponse xmlns:r="urn:UuVol-com:service:UuVolControl:5"><TracksXML>&lt;reciva&gt;&lt;playlist start="0" count="16" total="12"&gt;&lt;playlist-entry id="0"&gt;&lt;artist&gt;Example Artist&lt;/artist&gt;
 &lt;album&gt;Example Album&lt;/album&gt;
@@ -72,10 +50,10 @@ def test_parse_playlist_scalar_fields():
 
 
 def test_build_set_current_playlist_track_body() -> None:
-    body = sm6_playlist.build_set_current_playlist_track_body(track_id=3)
+    body = build_set_current_playlist_track_body(track_id=3)
     assert "SetCurrentPlaylistTrack" in body
     assert "<CurrentPlaylistTrackID>3</CurrentPlaylistTrackID>" in body
-    assert sm6_playlist.SET_CURRENT_PLAYLIST_TRACK_ACTION.endswith("#SetCurrentPlaylistTrack\"")
+    assert SET_CURRENT_PLAYLIST_TRACK_ACTION.endswith("#SetCurrentPlaylistTrack\"")
 
 
 def test_sm6_set_current_playlist_track_id_one_based() -> None:

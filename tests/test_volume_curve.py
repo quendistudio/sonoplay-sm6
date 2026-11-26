@@ -1,38 +1,18 @@
 """Tests calibrated SM6 volume curve (step 0 = mute, 28 audible steps)."""
 
-import importlib.util
-import sys
-import types
-from pathlib import Path
-
 import pytest
 
-_root = Path(__file__).resolve().parents[1]
-if str(_root) not in sys.path:
-    sys.path.insert(0, str(_root))
-
-_dlna_pkg = types.ModuleType("dlna")
-_dlna_pkg.__path__ = [str(_root / "dlna")]
-sys.modules.setdefault("dlna", _dlna_pkg)
-
-_spec = importlib.util.spec_from_file_location(
-    "dlna.volume_curve",
-    _root / "dlna" / "volume_curve.py",
+from dlna.volume_curve import (
+    PERCEPTUAL_DB_PER_HALVING,
+    VOLUME_STEPS,
+    _db_for_device,
+    _device_for_db,
+    _target_db_for_ui,
+    device_step,
+    device_to_ui,
+    quantize_device_up,
+    ui_to_device,
 )
-volume_curve = importlib.util.module_from_spec(_spec)
-sys.modules["dlna.volume_curve"] = volume_curve
-assert _spec.loader is not None
-_spec.loader.exec_module(volume_curve)
-
-PERCEPTUAL_DB_PER_HALVING = volume_curve.PERCEPTUAL_DB_PER_HALVING
-VOLUME_STEPS = volume_curve.VOLUME_STEPS
-_db_for_device = volume_curve._db_for_device
-_device_for_db = volume_curve._device_for_db
-_target_db_for_ui = volume_curve._target_db_for_ui
-device_step = volume_curve.device_step
-device_to_ui = volume_curve.device_to_ui
-quantize_device_up = volume_curve.quantize_device_up
-ui_to_device = volume_curve.ui_to_device
 
 
 def test_ui_to_device_endpoints() -> None:

@@ -1,30 +1,10 @@
 """Unit tests for PlayQueue track key matching."""
 
-import importlib
-import sys
-import types
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
-ROOT = Path(__file__).resolve().parents[2]
-
-
-def _ensure_plex_package_stub() -> None:
-    """Load plex.play_queue without executing plex/__init__.py (FastAPI side effects)."""
-    plex_pkg = sys.modules.get("plex")
-    if plex_pkg is None or not getattr(plex_pkg, "__path__", None):
-        plex_pkg = types.ModuleType("plex")
-        plex_pkg.__path__ = [str(ROOT / "plex")]
-        sys.modules["plex"] = plex_pkg
-
-
-_ensure_plex_package_stub()
-
-sys.modules.pop("plex.play_queue", None)
-play_queue = importlib.import_module("plex.play_queue")
-PlayQueue = play_queue.PlayQueue
+from plex.play_queue import PlayQueue
 
 
 @pytest.fixture

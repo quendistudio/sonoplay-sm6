@@ -40,6 +40,36 @@ def is_full_album_run(run: list[Any], album_track_count: int) -> bool:
     return indices == list(range(1, album_track_count + 1))
 
 
+def classify_sm6_play_mode_light(
+    *,
+    queue_total: int,
+    selected_track,
+    loaded_tracks: list,
+    album_leaf_count: int | None,
+) -> str | None:
+    """Classify play intent from queue metadata without full pagination.
+
+    Returns album|playlist|track, or None when ambiguous (fallback pagination).
+    """
+    _ = selected_track
+
+    if queue_total <= 1:
+        return "track"
+
+    parent_keys = {_parent_key(track) for track in loaded_tracks}
+    parent_keys.discard(None)
+    if len(parent_keys) > 1:
+        return "playlist"
+
+    if album_leaf_count is not None:
+        if queue_total == album_leaf_count:
+            return "album"
+        if queue_total < album_leaf_count:
+            return "playlist"
+
+    return None
+
+
 def detect_sm6_play_mode_from_tracks(tracks: list[Any]) -> str:
     """Classify Plex playQueue intent after the full queue has been paginated."""
     if len(tracks) <= 1:

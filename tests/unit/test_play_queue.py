@@ -1,13 +1,11 @@
 """Tests for PlayQueue playability / transcode detection."""
 
-import importlib
-import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
-from tests.conftest import ensure_real_plex_package, ensure_real_settings, reload_module
+from plex.play_queue import PlayQueue
 from tests.fixtures.plex_tracks import (
     EXAMPLE_SAMPLE_RATE_HZ,
     EXAMPLE_THRESHOLD_KBPS,
@@ -15,23 +13,6 @@ from tests.fixtures.plex_tracks import (
     FAKE_TRACK_KEY_B,
     hi_res_flac_track,
 )
-
-
-def _load_play_queue_class():
-    """Other unit tests stub plex.play_queue; reload the real module when needed."""
-    mod = sys.modules.get("plex.play_queue")
-    play_queue_cls = getattr(mod, "PlayQueue", None) if mod is not None else None
-    needs_reload = (
-        mod is None
-        or getattr(mod, "__file__", "").startswith("<stub")
-        or play_queue_cls is None
-        or play_queue_cls is MagicMock
-        or isinstance(play_queue_cls, MagicMock)
-    )
-    if needs_reload:
-        ensure_real_plex_package()
-        mod = reload_module("plex.play_queue")
-    return mod.PlayQueue
 
 
 class FakePlexLib:
@@ -57,24 +38,15 @@ class FakePlexLib:
 
 @pytest.fixture
 def play_queue():
-    PlayQueue = _load_play_queue_class()
     return PlayQueue("/playQueues/1", FakePlexLib())
 
 
 @pytest.fixture
-def transcode_thresholds(monkeypatch):
-    settings_pkg = ensure_real_settings()
-    from settings import Settings
-
-    real_settings = Settings()
-    monkeypatch.setattr(settings_pkg, "settings", real_settings)
-    monkeypatch.setattr(
-        real_settings, "audio_transcode_threshold_kbps", EXAMPLE_THRESHOLD_KBPS
+def transcode_thresholds(settings_override):
+    return settings_override(
+        audio_transcode_threshold_kbps=EXAMPLE_THRESHOLD_KBPS,
+        audio_transcode_max_sample_rate_hz=EXAMPLE_SAMPLE_RATE_HZ,
     )
-    monkeypatch.setattr(
-        real_settings, "audio_transcode_max_sample_rate_hz", EXAMPLE_SAMPLE_RATE_HZ
-    )
-    return real_settings
 
 
 class TestIsTrackPlayable:
@@ -184,8 +156,7 @@ class TestBuildTranscodeUrl:
         monkeypatch.setattr("plex.transcode_stream.settings", transcode_thresholds)
         monkeypatch.setattr("plex.transcode_auth.settings", transcode_thresholds)
         monkeypatch.setattr(
-            Settings,
-            "get_token_for_uuid",
+            "settings.Settings.get_token_for_uuid",
             lambda self, uuid: "test-token" if uuid == "dev-1" else None,
         )
         url = play_queue.build_sm6_transcode_proxy_url(
@@ -202,13 +173,11 @@ class TestBuildTranscodeUrl:
 
 class TestPlayQueueServerClear:
     def test_play_queue_id_from_container(self):
-        PlayQueue = _load_play_queue_class()
         assert PlayQueue.play_queue_id_from_container("/playQueues/3888?own=1") == 3888
         assert PlayQueue.play_queue_id_from_container(None) is None
 
     @pytest.mark.asyncio
     async def test_clear_server_play_queue(self, monkeypatch):
-        PlayQueue = _load_play_queue_class()
         lib = FakePlexLib()
         lib.request_headers = lambda *, accept_json=False: {"Accept": "application/json"}
 

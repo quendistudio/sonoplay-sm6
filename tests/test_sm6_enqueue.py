@@ -1,30 +1,13 @@
 """Tests Plex enqueue → SM6 QueueFolder action mapping."""
 
-import importlib.util
-import sys
-import types
-from pathlib import Path
-
-_root = Path(__file__).resolve().parents[1]
-if str(_root) not in sys.path:
-    sys.path.insert(0, str(_root))
-
-_dlna_pkg = types.ModuleType("dlna")
-_dlna_pkg.__path__ = [str(_root / "dlna")]
-sys.modules.setdefault("dlna", _dlna_pkg)
-
-_spec = importlib.util.spec_from_file_location(
-    "dlna.sm6_queue",
-    _root / "dlna" / "sm6_queue.py",
+from dlna.sm6_queue import (
+    QUEUE_ACTION_PLAY_FROM_HERE,
+    build_queue_folder_body,
+    initial_sm6_queue_action,
+    plan_refresh_enqueue_actions,
+    play_from_here_extra_info,
+    sm6_action_for_enqueue,
 )
-sm6_queue = importlib.util.module_from_spec(_spec)
-sys.modules["dlna.sm6_queue"] = sm6_queue
-assert _spec.loader is not None
-_spec.loader.exec_module(sm6_queue)
-
-sm6_action_for_enqueue = sm6_queue.sm6_action_for_enqueue
-initial_sm6_queue_action = sm6_queue.initial_sm6_queue_action
-plan_refresh_enqueue_actions = sm6_queue.plan_refresh_enqueue_actions
 
 
 def test_enqueue_mapping() -> None:
@@ -55,7 +38,6 @@ def test_initial_queue_action_play_for_single_track() -> None:
 
 
 def test_refresh_append_at_queue_tail() -> None:
-    # selected=0 (A*), new tracks at indices 3,4 → add to queue
     assert plan_refresh_enqueue_actions([3, 4], selected_after=0) == ["add", "add"]
 
 
@@ -76,12 +58,12 @@ def test_refresh_non_contiguous_not_play_next() -> None:
 
 
 def test_play_from_here_extra_info() -> None:
-    assert sm6_queue.play_from_here_extra_info("abc123") == "play-from-id:abc123"
-    assert sm6_queue.QUEUE_ACTION_PLAY_FROM_HERE == "PLAY_FROM_HERE"
+    assert play_from_here_extra_info("abc123") == "play-from-id:abc123"
+    assert QUEUE_ACTION_PLAY_FROM_HERE == "PLAY_FROM_HERE"
 
 
 def test_build_queue_folder_body_includes_extra_info() -> None:
-    body = sm6_queue.build_queue_folder_body(
+    body = build_queue_folder_body(
         didl="<DIDL/>",
         action="PLAY_FROM_HERE",
         server_udn="udn",

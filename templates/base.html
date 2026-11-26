@@ -82,7 +82,7 @@
                         <span>Bitrate Limit</span>
                         <span id="bitrateValue" style="color: var(--text-secondary);">1500 kbps</span>
                     </label>
-                    <input type="range" id="bitrateSlider" min="0" max="6" value="4" 
+                    <input type="range" id="bitrateSlider" min="0" max="7" value="4" 
                            style="width: 100%; cursor: pointer;"
                            oninput="updateBitrateLabel(this.value)">
                     <div style="display: flex; justify-content: space-between; font-size: 0.75rem; color: var(--text-tertiary); margin-top: 0.25rem;">
@@ -279,7 +279,7 @@
     <!-- Audio Settings Modal -->
     <script>
         // Slider value mappings
-        const bitrateStops = [0, 320, 500, 1000, 1500, 3000, 5000];
+        const bitrateStops = [0, 320, 500, 1000, 1500, 3000, 4000, 5000];
         const sampleRateStops = [0, 44100, 48000, 96000, 192000];
         
         function updateBitrateLabel(index) {

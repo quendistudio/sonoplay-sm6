@@ -20,3 +20,20 @@ def test_stream_cache_entry_from_legacy_string():
     entry = StreamCacheEntry.from_raw("http://example/object/x/y")
     assert entry is not None
     assert entry.url.endswith("/y")
+
+
+def test_from_track_tolerates_dotmap_duration():
+    from dotmap import DotMap
+    from types import SimpleNamespace
+
+    track = SimpleNamespace(
+        title="Example Track A",
+        parentTitle="Example Hi-Res Album",
+        grandparentTitle="Example Artist",
+        parentIndex=DotMap(),
+        duration=DotMap(),
+    )
+    entry = StreamCacheEntry.from_track(track, "http://example/object/x/y")
+    assert entry.duration_ms is None
+    assert entry.parent_index is None
+    assert entry.matches_track(track)

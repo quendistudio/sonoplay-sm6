@@ -84,9 +84,11 @@ class Sm6InstructionDispatcher:
         "_coalesce_slots",
         "_executor_task",
         "_active_queue_task",
+        "_active_transport_task",
         "_executing_task",
         "_started",
         "_shutdown",
+        "_poll_preempt_requested",
         "soap_lock",
         "_last_soap_monotonic",
     )
@@ -102,9 +104,11 @@ class Sm6InstructionDispatcher:
         self._coalesce_slots: dict[str, _WorkItem] = {}
         self._executor_task: asyncio.Task | None = None
         self._active_queue_task: asyncio.Task | None = None
+        self._active_transport_task: asyncio.Task | None = None
         self._executing_task: asyncio.Task | None = None
         self._started = False
         self._shutdown = False
+        self._poll_preempt_requested = False
         self.soap_lock = _ReentrantSoapLock()
         self._last_soap_monotonic = 0.0
 
@@ -128,6 +132,19 @@ class Sm6InstructionDispatcher:
     def current_generation(self) -> int:
         return self._generation
 
+    def preempt_transport_lane(self) -> None:
+        """Drop pending transport jobs and cancel the in-flight one (stale playMedia)."""
+        while True:
+            try:
+                stale = self._transport_q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            stale.error = asyncio.CancelledError("transport lane preempted")
+            stale.done.set()
+        active = self._active_transport_task
+        if active is not None and not active.done():
+            active.cancel()
+
     def bump_generation(self) -> int:
         self._generation += 1
         self._drain_queue_lane()
@@ -143,6 +160,15 @@ class Sm6InstructionDispatcher:
 
     def control_pending(self) -> bool:
         return not self._control_q.empty()
+
+    def poll_preempt_requested(self) -> bool:
+        return self._poll_preempt_requested
+
+    def _request_poll_preempt(self) -> None:
+        self._poll_preempt_requested = True
+
+    def _clear_poll_preempt(self) -> None:
+        self._poll_preempt_requested = False
 
     def _drain_queue_lane(self) -> None:
         while True:
@@ -170,6 +196,8 @@ class Sm6InstructionDispatcher:
         self._ensure_started()
         if preempts_queue:
             self.bump_generation()
+            self.preempt_transport_lane()
+            self._request_poll_preempt()
 
         item = _WorkItem(
             lane=lane,
@@ -308,6 +336,10 @@ class Sm6InstructionDispatcher:
             await asyncio.sleep(remaining)
 
     async def _execute_item(self, item: _WorkItem) -> None:
+        if item.done.is_set():
+            self._drop_coalesce_slot(item)
+            return
+
         if item.lane == "queue" and item.generation != self._generation:
             logger.debug(
                 "SM6 dispatcher skip stale queue job %s gen=%s current=%s",
@@ -348,6 +380,8 @@ class Sm6InstructionDispatcher:
         finally:
             item.done.set()
             self._drop_coalesce_slot(item)
+            if item.lane == "poll":
+                self._clear_poll_preempt()
 
     def _drop_coalesce_slot(self, item: _WorkItem) -> None:
         for key, coalesced in list(self._coalesce_slots.items()):
@@ -364,6 +398,8 @@ class Sm6InstructionDispatcher:
                 )
                 if item.lane == "queue":
                     self._active_queue_task = exec_task
+                elif item.lane == "transport":
+                    self._active_transport_task = exec_task
                 try:
                     await exec_task
                 except asyncio.CancelledError:
@@ -371,6 +407,8 @@ class Sm6InstructionDispatcher:
                 finally:
                     if self._active_queue_task is exec_task:
                         self._active_queue_task = None
+                    if self._active_transport_task is exec_task:
+                        self._active_transport_task = None
         except asyncio.CancelledError:
             return
 

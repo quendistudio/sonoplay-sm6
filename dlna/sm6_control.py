@@ -94,6 +94,7 @@ logger = logging.getLogger(__name__)
 _SOAP_RETRIES = 3
 _SOAP_RETRY_DELAY_SECONDS = 0.12
 _NAVIGATOR_ID_CACHE: dict[str, str] = {}
+_QUEUE_FOLDER_INFLIGHT: dict[str, asyncio.Task] = {}
 
 
 async def sm6_transport_key_pressed(device, key: str) -> None:
@@ -122,7 +123,51 @@ class Sm6Control:
         _NAVIGATOR_ID_CACHE[self._description_url] = navigator_id
         return navigator_id
 
-    async def _post(self, url: str, body: str, soap_action: str, *, label: str) -> str:
+    def _clear_navigator_cache(self) -> None:
+        self._cached_plex_navigator_id = None
+        _NAVIGATOR_ID_CACHE.pop(self._description_url, None)
+
+    async def _reregister_plex_navigator(self, *, failed_id: str) -> str | None:
+        """Force a fresh navigator after BAD_NAVIGATOR (bypass settings + cache)."""
+        self._clear_navigator_cache()
+        if not settings.sm6_plex_navigator_auto_register:
+            return None
+
+        for name in await self._navigator_name_candidates():
+            navigator_id = await self._register_named_navigator(name)
+            if not navigator_id:
+                continue
+            registered, confirmed_id = await self._query_registered_navigator(name)
+            resolved = confirmed_id or navigator_id
+            if not resolved or resolved == failed_id:
+                continue
+            logger.info(
+                "SM6 Plex navigator re-registered after BAD_NAVIGATOR name=%r id=%s (was %s)",
+                name,
+                resolved,
+                failed_id,
+            )
+            return self._remember_navigator_id(resolved)
+
+        navigator_id = await self._register_anonymous_navigator()
+        if navigator_id and navigator_id != failed_id:
+            logger.info(
+                "SM6 Plex navigator re-registered anonymous after BAD_NAVIGATOR id=%s (was %s)",
+                navigator_id,
+                failed_id,
+            )
+            return self._remember_navigator_id(navigator_id)
+        return None
+
+    async def _post(
+        self,
+        url: str,
+        body: str,
+        soap_action: str,
+        *,
+        label: str,
+        retry_on_timeout: bool = True,
+    ) -> str:
         headers = {
             "SOAPAction": soap_action,
             'Content-Type': 'text/xml; charset="utf-8"',
@@ -144,7 +189,34 @@ class Sm6Control:
                     return text
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 last_error = exc
+                # Non-idempotent actions: only a refused connection proves the SM6 never got it.
+                if not retry_on_timeout and not isinstance(exc, aiohttp.ClientConnectorError):
+                    break
         raise RuntimeError(f"{label} unavailable") from last_error
+
+    async def _wait_queue_folder_idle(self) -> None:
+        url = reciva_radio_invoke_url(self._description_url)
+        while (previous := _QUEUE_FOLDER_INFLIGHT.get(url)) is not None and not previous.done():
+            logger.info("SM6 waiting for in-flight QueueFolder")
+            await asyncio.wait({previous})
+
+    async def _post_queue_folder(self, body: str) -> str:
+        """Serialize QueueFolder per device and never cancel one the SM6 may be executing."""
+        url = reciva_radio_invoke_url(self._description_url)
+        await self._wait_queue_folder_idle()
+        task = asyncio.create_task(
+            self._post(
+                url,
+                body,
+                QUEUE_FOLDER_SOAP_ACTION,
+                label="QueueFolder",
+                retry_on_timeout=False,
+            )
+        )
+        # Retrieve the outcome even when the awaiting caller was cancelled.
+        task.add_done_callback(lambda t: t.cancelled() or t.exception())
+        _QUEUE_FOLDER_INFLIGHT[url] = task
+        return await asyncio.shield(task)
 
     async def _navigator_name_candidates(self) -> list[str]:
         names: list[str] = []
@@ -253,6 +325,7 @@ class Sm6Control:
         )
 
     async def clear_queue(self) -> None:
+        await self._wait_queue_folder_idle()
         logger.info("SM6 DeleteAll (clear internal queue)")
         await self._post(
             uu_playlist_invoke_url(self._description_url),
@@ -315,19 +388,39 @@ class Sm6Control:
             resolved,
             extra_info or "",
         )
-        xml = await self._post(
-            reciva_radio_invoke_url(self._description_url),
-            body,
-            QUEUE_FOLDER_SOAP_ACTION,
-            label="QueueFolder",
-        )
+        xml = await self._post_queue_folder(body)
         result = parse_queue_folder_result(xml)
         if result == "BAD_NAVIGATOR":
-            self._cached_plex_navigator_id = None
-            _NAVIGATOR_ID_CACHE.pop(self._description_url, None)
-            raise RuntimeError(
-                f"QueueFolder: Plex navigator id={resolved!r} not recognized by the SM6"
+            self._clear_navigator_cache()
+            fresh = await self._reregister_plex_navigator(failed_id=resolved)
+            if not fresh:
+                raise RuntimeError(
+                    f"QueueFolder: Plex navigator id={resolved!r} not recognized by the SM6 "
+                    "(re-register failed or disabled)"
+                )
+            logger.warning(
+                "SM6 QueueFolder BAD_NAVIGATOR id=%s — retrying once with re-registered id=%s",
+                resolved,
+                fresh,
             )
+            retry_body = build_queue_folder_body(
+                didl=didl,
+                action=action,
+                server_udn=server_udn,
+                navigator_id=fresh,
+                extra_info=extra_info,
+            )
+            retry_xml = await self._post_queue_folder(retry_body)
+            retry_result = parse_queue_folder_result(retry_xml)
+            if retry_result == "BAD_NAVIGATOR":
+                self._clear_navigator_cache()
+                raise RuntimeError(
+                    f"QueueFolder: Plex navigator id={fresh!r} not recognized by the SM6 "
+                    f"(retry after BAD_NAVIGATOR on {resolved!r})"
+                )
+            if retry_result != "OK":
+                raise RuntimeError(f"QueueFolder: {retry_result or 'missing Result'}")
+            return
         if result != "OK":
             raise RuntimeError(f"QueueFolder: {result or 'missing Result'}")
 

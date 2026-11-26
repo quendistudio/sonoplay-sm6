@@ -233,6 +233,13 @@ class DlnaDeviceService(object):
         
         return None  # Not a valid SOAP Fault - retry
 
+    def _soap_retry_delay_seconds(self) -> float:
+        from plex.device_profiles import is_sm6_like
+
+        if is_sm6_like(self.device):
+            return float(getattr(settings, "sm6_soap_retry_delay_seconds", 0.05))
+        return 0.5
+
     async def control(self, action: str, data: dict, client: aiohttp.ClientSession = None):
         headers = {
             'Content-type': 'text/xml',
@@ -312,7 +319,7 @@ class DlnaDeviceService(object):
                                 self.device.name, action,
                                 "timeout" if isinstance(e, asyncio.TimeoutError) else "connection error",
                                 attempt, MAX_RETRIES, str(e))
-                    await asyncio.sleep(0.5)  # Brief delay before retry
+                    await asyncio.sleep(self._soap_retry_delay_seconds())
                     continue
                 # All retries exhausted
                 logger.warning("dlna %s %s connection failed after %d attempts: %s",
@@ -340,7 +347,7 @@ class DlnaDeviceService(object):
                 if attempt < MAX_RETRIES:
                     logger.debug("dlna %s %s server error %d (attempt %d/%d), retrying",
                                 self.device.name, action, e.status, attempt, MAX_RETRIES)
-                    await asyncio.sleep(0.5)  # Brief delay before retry
+                    await asyncio.sleep(self._soap_retry_delay_seconds())
                     continue
                 logger.warning("dlna %s %s server error %d after %d attempts",
                               self.device.name, action, e.status, MAX_RETRIES)

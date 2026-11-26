@@ -7,23 +7,28 @@ def test_resolve_pms_token_prefers_env(monkeypatch):
     monkeypatch.setattr(
         "plex.transcode_stream.settings.plex_pms_token",
         "env-token",
+        raising=False,
     )
     monkeypatch.setattr(
-        "plex.transcode_stream.settings.load_data",
-        lambda: {"dev-1": {"token": "paired-token"}},
+        "settings.Settings.load_data",
+        lambda self: {"dev-1": {"token": "paired-token"}},
     )
     assert resolve_pms_token_for_proxy(device_uuid="dev-1") == "env-token"
 
 
 def test_resolve_pms_token_uses_device_pairing(monkeypatch):
-    monkeypatch.setattr("plex.transcode_stream.settings.plex_pms_token", None)
     monkeypatch.setattr(
-        "plex.transcode_stream.settings.get_token_for_uuid",
-        lambda uuid: "device-a-token" if uuid == "dev-a" else None,
+        "plex.transcode_stream.settings.plex_pms_token",
+        None,
+        raising=False,
     )
     monkeypatch.setattr(
-        "plex.transcode_stream.settings.load_data",
-        lambda: {
+        "settings.Settings.get_token_for_uuid",
+        lambda self, uuid: "device-a-token" if uuid == "dev-a" else None,
+    )
+    monkeypatch.setattr(
+        "settings.Settings.load_data",
+        lambda self: {
             "dev-a": {"token": "device-a-token"},
             "dev-b": {"token": "device-b-token"},
         },
@@ -32,14 +37,18 @@ def test_resolve_pms_token_uses_device_pairing(monkeypatch):
 
 
 def test_resolve_pms_token_rejects_multi_account_without_env(monkeypatch):
-    monkeypatch.setattr("plex.transcode_stream.settings.plex_pms_token", None)
     monkeypatch.setattr(
-        "plex.transcode_stream.settings.get_token_for_uuid",
-        lambda uuid: None,
+        "plex.transcode_stream.settings.plex_pms_token",
+        None,
+        raising=False,
     )
     monkeypatch.setattr(
-        "plex.transcode_stream.settings.load_data",
-        lambda: {
+        "settings.Settings.get_token_for_uuid",
+        lambda self, uuid: None,
+    )
+    monkeypatch.setattr(
+        "settings.Settings.load_data",
+        lambda self: {
             "dev-a": {"token": "token-a"},
             "dev-b": {"token": "token-b"},
         },

@@ -5,7 +5,10 @@ from plex.sm6_session_rules import (
     ignore_stale_plex_volume_write,
     plex_playqueue_offset,
     plex_queue_index_from_sm6,
+    sm6_connect_should_rebuild_from_playlist,
     sm6_external_playback_allowed,
+    sm6_plex_stop_should_clear_playlist,
+    sm6_power_transition_should_clear_playlist,
     sm6_should_detach_on_audio_source,
     sm6_stop_should_relinquish,
 )
@@ -45,6 +48,39 @@ def test_transport_keeps_playing_during_outbound_stop_glitch() -> None:
         optimistic_play_active=False,
     )
     assert accepted == "PLAYING"
+
+
+def test_transport_keeps_playing_while_owned_without_outbound() -> None:
+    accepted = accept_sm6_polled_transport_state(
+        "STOPPED",
+        "PLAYING",
+        outbound_active=False,
+        optimistic_play_active=False,
+        sonoplay_owned=True,
+    )
+    assert accepted == "PLAYING"
+
+
+def test_transport_keeps_transitioning_while_owned() -> None:
+    accepted = accept_sm6_polled_transport_state(
+        "STOPPED",
+        "TRANSITIONING",
+        outbound_active=False,
+        optimistic_play_active=False,
+        sonoplay_owned=True,
+    )
+    assert accepted == "TRANSITIONING"
+
+
+def test_transport_accepts_stop_when_not_owned() -> None:
+    accepted = accept_sm6_polled_transport_state(
+        "STOPPED",
+        "PLAYING",
+        outbound_active=False,
+        optimistic_play_active=False,
+        sonoplay_owned=False,
+    )
+    assert accepted == "STOPPED"
 
 
 def test_transport_accepts_device_pause_after_optimistic_window() -> None:
@@ -170,3 +206,36 @@ def test_external_playback_allowed_on_media_player() -> None:
 
 def test_external_playback_allowed_when_source_unknown() -> None:
     assert sm6_external_playback_allowed(None, media_player_id=10)
+
+
+def test_plex_stop_always_clears_playlist() -> None:
+    assert sm6_plex_stop_should_clear_playlist()
+
+
+
+def test_power_on_to_idle_clears_playlist() -> None:
+    assert sm6_power_transition_should_clear_playlist("ON", "IDLE")
+
+
+def test_power_idle_to_on_clears_playlist() -> None:
+    assert sm6_power_transition_should_clear_playlist("IDLE", "ON")
+
+
+def test_power_unchanged_on_does_not_clear() -> None:
+    assert not sm6_power_transition_should_clear_playlist("ON", "ON")
+
+
+def test_power_first_poll_already_on_does_not_clear() -> None:
+    assert not sm6_power_transition_should_clear_playlist(None, "ON")
+
+
+def test_connect_rebuilds_when_on_with_playlist() -> None:
+    assert sm6_connect_should_rebuild_from_playlist("ON", playlist_length=3)
+
+
+def test_connect_no_rebuild_when_idle() -> None:
+    assert not sm6_connect_should_rebuild_from_playlist("IDLE", playlist_length=3)
+
+
+def test_connect_no_rebuild_when_playlist_empty() -> None:
+    assert not sm6_connect_should_rebuild_from_playlist("ON", playlist_length=0)

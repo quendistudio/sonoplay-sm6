@@ -1,23 +1,13 @@
 """Tests SM6 queue segment planning (album container batching)."""
 
-import importlib.util
-import sys
-from pathlib import Path
 from types import SimpleNamespace
 
-_root = Path(__file__).resolve().parents[1]
-_spec = importlib.util.spec_from_file_location(
-    "plex.sm6_queue_plan",
-    _root / "plex" / "sm6_queue_plan.py",
+from plex.sm6_queue_plan import (
+    classify_sm6_play_mode_light,
+    detect_sm6_play_mode_from_tracks,
+    is_full_album_run,
+    plan_queue_segments,
 )
-sm6_queue_plan = importlib.util.module_from_spec(_spec)
-sys.modules["plex.sm6_queue_plan"] = sm6_queue_plan
-assert _spec.loader is not None
-_spec.loader.exec_module(sm6_queue_plan)
-
-is_full_album_run = sm6_queue_plan.is_full_album_run
-plan_queue_segments = sm6_queue_plan.plan_queue_segments
-detect_sm6_play_mode_from_tracks = sm6_queue_plan.detect_sm6_play_mode_from_tracks
 
 
 def _track(parent_key: str, parent_index: int, title: str = "t") -> SimpleNamespace:
@@ -78,3 +68,45 @@ def test_detect_play_mode_track_when_only_one_loaded() -> None:
 def test_detect_play_mode_playlist_for_multi_album() -> None:
     tracks = [_track("a1", 1), _track("a2", 1)]
     assert detect_sm6_play_mode_from_tracks(tracks) == "playlist"
+
+
+def _light(
+    *,
+    queue_total: int,
+    loaded_tracks: list,
+    album_leaf_count: int | None,
+    selected_track=None,
+) -> str | None:
+    if selected_track is None and loaded_tracks:
+        selected_track = loaded_tracks[0]
+    return classify_sm6_play_mode_light(
+        queue_total=queue_total,
+        selected_track=selected_track,
+        loaded_tracks=loaded_tracks,
+        album_leaf_count=album_leaf_count,
+    )
+
+
+def test_classify_light_full_album() -> None:
+    loaded = [_track("album1", i) for i in range(1, 4)]
+    assert _light(queue_total=9, loaded_tracks=loaded, album_leaf_count=9) == "album"
+
+
+def test_classify_light_partial_album() -> None:
+    loaded = [_track("album1", i) for i in range(1, 4)]
+    assert _light(queue_total=3, loaded_tracks=loaded, album_leaf_count=9) == "playlist"
+
+
+def test_classify_light_multi_album() -> None:
+    loaded = [_track("a1", 1), _track("a2", 1)]
+    assert _light(queue_total=2, loaded_tracks=loaded, album_leaf_count=9) == "playlist"
+
+
+def test_classify_light_single_track() -> None:
+    loaded = [_track("album1", 1)]
+    assert _light(queue_total=1, loaded_tracks=loaded, album_leaf_count=9) == "track"
+
+
+def test_classify_light_ambiguous_without_leaf_count() -> None:
+    loaded = [_track("album1", i) for i in range(1, 4)]
+    assert _light(queue_total=3, loaded_tracks=loaded, album_leaf_count=None) is None

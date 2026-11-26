@@ -3,6 +3,8 @@ from __future__ import annotations
 
 _ACTIVE_TRANSPORT = frozenset({"PLAYING", "PAUSED_PLAYBACK"})
 _STOPPED_TRANSPORT = frozenset({"STOPPED", "NO_MEDIA_PRESENT"})
+# Local states that mean "we still intend to play" — SM6 STOPPED flickers must not win.
+_INTENDED_PLAY = _ACTIVE_TRANSPORT | {"TRANSITIONING"}
 
 
 def plex_queue_index_from_sm6(
@@ -37,14 +39,20 @@ def accept_sm6_polled_transport_state(
     *,
     outbound_active: bool,
     optimistic_play_active: bool,
+    sonoplay_owned: bool = False,
 ) -> str:
-    """Effective transport state while SonoPlay owns SM6 playback."""
+    """Effective transport state: a SM6 STOPPED flicker must not become the Plex timeline.
+
+    While we still intend to play (owned session or we just sent a command), keep
+    PLAYING / PAUSED / TRANSITIONING. A real front-panel stop clears ownership
+    first (sm6_stop_should_relinquish), then STOPPED is accepted.
+    """
     if polled == "PLAYING":
         return polled
     if (
         polled in _STOPPED_TRANSPORT
-        and current in _ACTIVE_TRANSPORT
-        and outbound_active
+        and current in _INTENDED_PLAY
+        and (outbound_active or sonoplay_owned)
     ):
         return current
     if (
@@ -121,3 +129,50 @@ def sm6_external_playback_allowed(
     if last_audio_source is None:
         return True
     return last_audio_source == media_player_id
+
+
+_POWER_OFF_LIKE = frozenset({"OFF", "IDLE"})
+_POWER_ON = "ON"
+
+
+def sm6_plex_stop_should_clear_playlist() -> bool:
+    """Plex STOP clears the client play queue — SM6 must DeleteAll to match.
+
+    A single Plex STOP is enough (Plex UI does not offer a useful second STOP).
+    """
+    return True
+
+
+def sm6_power_transition_should_clear_playlist(
+    previous: str | None,
+    current: str | None,
+) -> bool:
+    """True when a power transition should clear the SM6 playlist (like Plex STOP).
+
+    ON → OFF/IDLE, or OFF/IDLE → ON (missed sleep). Unchanged / unknown / first
+    poll while already ON does not clear.
+    """
+    if current is None or previous is None:
+        return False
+    if previous == current:
+        return False
+    prev_off = previous in _POWER_OFF_LIKE
+    curr_off = current in _POWER_OFF_LIKE
+    prev_on = previous == _POWER_ON
+    curr_on = current == _POWER_ON
+    if prev_on and curr_off:
+        return True
+    if prev_off and curr_on:
+        return True
+    return False
+
+
+def sm6_connect_should_rebuild_from_playlist(
+    power: str | None,
+    *,
+    playlist_length: int,
+) -> bool:
+    """True when connect should import SM6 playlist into a Plex playQueue."""
+    if power != _POWER_ON:
+        return False
+    return int(playlist_length) > 0

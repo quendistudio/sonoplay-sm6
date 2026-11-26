@@ -38,8 +38,8 @@ def test_build_sm6_transcode_proxy_url(monkeypatch):
         raising=False,
     )
     monkeypatch.setattr(
-        "plex.transcode_stream.settings.get_token_for_uuid",
-        lambda uuid: "test-token" if uuid == "dev-1" else None,
+        "settings.Settings.get_token_for_uuid",
+        lambda self, uuid: "test-token" if uuid == "dev-1" else None,
     )
     url = build_sm6_transcode_proxy_url(FAKE_TRACK_KEY_A, "dev-1")
     assert url.startswith(

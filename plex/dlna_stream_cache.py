@@ -11,6 +11,20 @@ _RATING_KEY_PATH = re.compile(r"/library/metadata/(\d+)(?:/|$|\?)")
 _RES_TAG = re.compile(r"(<res[^>]*>)(.*?)(</res>)", re.S)
 
 
+def _int_or_none(value: Any) -> int | None:
+    # getattr on DotMap vivifies missing keys; int(DotMap()) is 1, not TypeError.
+    if value is None:
+        return None
+    from dotmap import DotMap
+
+    if isinstance(value, (DotMap, dict, list, tuple)):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 @dataclass
 class StreamCacheEntry:
     url: str
@@ -31,34 +45,32 @@ class StreamCacheEntry:
             return False
         if artist and self.artist and str(artist).casefold() != str(self.artist).casefold():
             return False
-        parent_index = getattr(track, "parentIndex", None)
+        parent_index = _int_or_none(getattr(track, "parentIndex", None))
         if (
             self.parent_index is not None
             and parent_index is not None
-            and int(self.parent_index) != int(parent_index)
+            and int(self.parent_index) != parent_index
         ):
             return False
-        duration_ms = getattr(track, "duration", None)
+        duration_ms = _int_or_none(getattr(track, "duration", None))
         if (
             self.duration_ms is not None
             and duration_ms is not None
-            and abs(int(self.duration_ms) - int(duration_ms)) > 2000
+            and abs(int(self.duration_ms) - duration_ms) > 2000
         ):
             return False
         return True
 
     @classmethod
     def from_track(cls, track, url: str, *, object_id: str | None = None) -> StreamCacheEntry:
-        parent_index = getattr(track, "parentIndex", None)
-        duration_ms = getattr(track, "duration", None)
         return cls(
             url=url,
             object_id=object_id,
             title=getattr(track, "title", None),
             album=getattr(track, "parentTitle", None),
             artist=getattr(track, "grandparentTitle", None) or getattr(track, "parentTitle", None),
-            parent_index=int(parent_index) if parent_index is not None else None,
-            duration_ms=int(duration_ms) if duration_ms is not None else None,
+            parent_index=_int_or_none(getattr(track, "parentIndex", None)),
+            duration_ms=_int_or_none(getattr(track, "duration", None)),
         )
 
     @classmethod
@@ -66,16 +78,14 @@ class StreamCacheEntry:
         if isinstance(raw, str):
             return cls(url=raw)
         if isinstance(raw, dict) and raw.get("url"):
-            parent_index = raw.get("parent_index")
-            duration_ms = raw.get("duration_ms")
             return cls(
                 url=str(raw["url"]),
                 object_id=raw.get("object_id"),
                 title=raw.get("title"),
                 album=raw.get("album"),
                 artist=raw.get("artist"),
-                parent_index=int(parent_index) if parent_index is not None else None,
-                duration_ms=int(duration_ms) if duration_ms is not None else None,
+                parent_index=_int_or_none(raw.get("parent_index")),
+                duration_ms=_int_or_none(raw.get("duration_ms")),
             )
         return None
 

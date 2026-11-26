@@ -5,55 +5,30 @@ RenderingControl SOAP endpoint; after this module finishes, SetVolume step 28
 (100 %) is sent so the amplifier is left at full volume.
 """
 
-import importlib.util
 import os
-import sys
-import types
 import urllib.error
 import urllib.request
-from pathlib import Path
 
 import pytest
 
-_root = Path(__file__).resolve().parents[1]
-if str(_root) not in sys.path:
-    sys.path.insert(0, str(_root))
+from dlna.sm6_volume import (
+    VolumeRange,
+    device_to_dlna_level,
+    device_to_plex,
+    device_to_step,
+    dlna_level_to_device,
+    dlna_level_to_plex,
+    plex_for_step,
+    plex_to_device,
+    plex_to_dlna_level,
+    plex_to_step,
+    plexamp_volume_step,
+    step_to_dlna_level,
+)
+from dlna.volume_curve import VOLUME_STEPS, device_step, ui_to_device
 
-_dlna_pkg = types.ModuleType("dlna")
-_dlna_pkg.__path__ = [str(_root / "dlna")]
-sys.modules.setdefault("dlna", _dlna_pkg)
-
-for name, filename in (
-    ("dlna.volume_curve", "volume_curve.py"),
-    ("dlna.sm6_volume", "sm6_volume.py"),
-):
-    spec = importlib.util.spec_from_file_location(name, _root / "dlna" / filename)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-
-sm6_volume = sys.modules["dlna.sm6_volume"]
-volume_curve = sys.modules["dlna.volume_curve"]
-
-VolumeRange = sm6_volume.VolumeRange
 SM6_RANGE = VolumeRange(minimum=0, maximum=28, step=1)
 DLNA_100_RANGE = VolumeRange(minimum=0, maximum=100, step=1)
-
-device_to_step = sm6_volume.device_to_step
-device_to_dlna_level = sm6_volume.device_to_dlna_level
-device_to_plex = sm6_volume.device_to_plex
-dlna_level_to_device = sm6_volume.dlna_level_to_device
-dlna_level_to_plex = sm6_volume.dlna_level_to_plex
-plex_to_device = sm6_volume.plex_to_device
-plex_to_dlna_level = sm6_volume.plex_to_dlna_level
-step_to_dlna_level = sm6_volume.step_to_dlna_level
-plexamp_volume_step = sm6_volume.plexamp_volume_step
-plex_to_step = sm6_volume.plex_to_step
-plex_for_step = sm6_volume.plex_for_step
-device_step = volume_curve.device_step
-ui_to_device = volume_curve.ui_to_device
-VOLUME_STEPS = volume_curve.VOLUME_STEPS
 
 _UPNP_RC = "urn:schemas-upnp-org:service:RenderingControl:1"
 _FULL_VOLUME_SOAP = (

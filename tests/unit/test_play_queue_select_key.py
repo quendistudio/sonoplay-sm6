@@ -1,32 +1,16 @@
 """PlayQueue.select_track_key — album parent key matching (Plexamp thematic queues)."""
 
-import importlib.util
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
+from plex.play_queue import PlayQueue
 from tests.unit.test_play_queue import FakePlexLib
-
-_ROOT = Path(__file__).resolve().parents[2]
-
-
-def _load_play_queue_class_isolated():
-    """Load play_queue without evicting other plex.* modules from sys.modules."""
-    spec = importlib.util.spec_from_file_location(
-        "sonoplay_play_queue_select_key_test",
-        _ROOT / "plex" / "play_queue.py",
-    )
-    mod = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(mod)
-    return mod.PlayQueue
 
 
 @pytest.fixture
 def select_track_queue():
-    PlayQueue = _load_play_queue_class_isolated()
     queue = PlayQueue("/playQueues/1", FakePlexLib())
     queue.total_count = AsyncMock(return_value=2)
     return queue
