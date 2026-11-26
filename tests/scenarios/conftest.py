@@ -69,7 +69,7 @@ async def sm6_adapter(fake_sm6, monkeypatch, temp_data_dir, settings_override):
     monkeypatch.setattr(adapter, "_sm6_refresh_playlist_snapshot", _refresh)
     monkeypatch.setattr(adapter, "_sm6_after_queue_folder", _after)
     monkeypatch.setattr(adapter, "_sm6_notify_plex_timeline_sync", lambda: None)
-    monkeypatch.setattr(adapter, "_sm6_wake_waiters", lambda: None)
+    monkeypatch.setattr(adapter, "_sm6_wake_waiters", lambda **_kw: None)
     # Never hit a real PMS when clearing the playQueue mirror.
     monkeypatch.setattr(
         adapter, "_ensure_plex_lib_for_sm6_api", AsyncMock(return_value=False)

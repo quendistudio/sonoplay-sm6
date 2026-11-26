@@ -2138,6 +2138,10 @@ class PlexDlnaAdapter(object):
         current = self._sm6_outbound_until or 0.0
         self._sm6_outbound_until = max(current, deadline)
 
+    def _sm6_tail_fill_building(self) -> bool:
+        task = self._sm6_tail_fill_task
+        return task is not None and not task.done() and task is not asyncio.current_task()
+
     def _sm6_outbound_active(self) -> bool:
         return (
             self._sm6_outbound_until is not None
@@ -3164,6 +3168,9 @@ class PlexDlnaAdapter(object):
     ) -> bool:
         """Rebuild the Plex playQueue to mirror the SM6 native playlist."""
         if not self._is_sm6_renderer():
+            return False
+        if self._sm6_tail_fill_building():
+            # Partial SM6 playlist during tail fill must never overwrite the Plex queue.
             return False
         if self._sm6_plex_play_in_progress and not force:
             return False
@@ -4722,6 +4729,8 @@ class PlexDlnaAdapter(object):
             start_index=start_index,
             offset=offset,
             paused=paused,
+            # SM6 holds only the first track until tail fill ends; realign then.
+            realign=not multi_track_queue,
         )
 
         self.current_track_info = first_track
@@ -4790,6 +4799,7 @@ class PlexDlnaAdapter(object):
             queue_tracks = tracks[start_index:]
             if len(queue_tracks) <= 1:
                 self._sm6_synced_tail_item_ids = ()
+                await self._sm6_realign_plex_queue_with_sm6()
                 return
 
             segments = await self._plan_sm6_queue_segments(queue_tracks)
@@ -4863,7 +4873,7 @@ class PlexDlnaAdapter(object):
                 len(queue_tracks),
                 append_count,
             )
-            await self._sm6_refresh_playlist_snapshot()
+            await self._sm6_realign_plex_queue_with_sm6()
             self._sm6_wake_waiters()
         except asyncio.CancelledError:
             logger.debug("%s SM6 playlist tail fill cancelled", self.dlna.name)
@@ -4893,6 +4903,7 @@ class PlexDlnaAdapter(object):
         start_index: int = 0,
         offset: int = 0,
         paused: bool = False,
+        realign: bool = True,
     ) -> None:
         """Project PLAYING + elapsed extrapolation as soon as the first queue segment lands."""
         self.current_track_info = track
@@ -4907,10 +4918,16 @@ class PlexDlnaAdapter(object):
             position=position,
         )
         self._sm6_arm_timeline_after_http(elapsed_ms=int(offset or 0))
-        await self._sm6_after_queue_folder(offset=offset, paused=False)
+        await self._sm6_after_queue_folder(offset=offset, paused=False, realign=realign)
         self._sm6_notify_plex_timeline_sync()
 
-    async def _sm6_after_queue_folder(self, *, offset: int = 0, paused: bool = False) -> None:
+    async def _sm6_after_queue_folder(
+        self,
+        *,
+        offset: int = 0,
+        paused: bool = False,
+        realign: bool = True,
+    ) -> None:
         """Post-QueueFolder bookkeeping; Plex-side assume is armed at play/skip."""
         self.state.check_all_next_loop = True
         # ponytail: SM6 AVTransport Seek returns UPnPError after QueueFolder PLAY_NOW
@@ -4921,6 +4938,13 @@ class PlexDlnaAdapter(object):
                 offset,
             )
         self._sm6_mark_outbound_activity()
+        if realign:
+            await self._sm6_realign_plex_queue_with_sm6()
+        if paused:
+            await self._sm6_pause()
+            return
+
+    async def _sm6_realign_plex_queue_with_sm6(self) -> None:
         # PLAY_NOW / PLAY_FROM_HERE may leave prior SM6 items in place — rebuild Plex
         # from the device so both queues stay identical (never stamp fingerprint alone).
         try:
@@ -4940,9 +4964,6 @@ class PlexDlnaAdapter(object):
                 self.dlna.name,
                 exc,
             )
-        if paused:
-            await self._sm6_pause()
-            return
 
     async def _sm6_pause(self) -> None:
         logger.info("%s SM6 pause via KeyPressed PLAY_PAUSE", self.dlna.name)

@@ -46,6 +46,7 @@ class FakePlayQueue:
     ) -> None:
         self.tracks = list(tracks or make_album_tracks())
         self.container_key = container_key
+        self.start_offset = 0
         self._selected = selected
         self.info = SimpleNamespace(
             playQueueID=play_queue_id,
@@ -59,6 +60,10 @@ class FakePlayQueue:
 
     async def _get_info(self):
         return self.info
+
+    @property
+    def last_offset(self) -> int:
+        return len(self.tracks) - 1
 
     async def selected_offset(self) -> int:
         return self._selected
