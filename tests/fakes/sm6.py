@@ -52,6 +52,7 @@ class FakeSm6:
     timeout_labels: set[str] = field(default_factory=set)
     refuse_labels: set[str] = field(default_factory=set)
     hang_labels: set[str] = field(default_factory=set)
+    disconnect_once_labels: set[str] = field(default_factory=set)
     _hang_release: asyncio.Event | None = field(default=None, repr=False)
     _call_count: dict[str, int] = field(default_factory=dict)
 
@@ -86,6 +87,9 @@ class FakeSm6:
                 "192.168.50.99", 8050, False, None, None, None, None
             )
             raise aiohttp.ClientConnectorError(key, OSError("refused"))
+        if label in self.disconnect_once_labels:
+            self.disconnect_once_labels.discard(label)
+            raise aiohttp.ServerDisconnectedError()
         if label in self.timeout_labels or base in self.timeout_labels:
             raise asyncio.TimeoutError()
         if label in self.hang_labels or base in self.hang_labels:

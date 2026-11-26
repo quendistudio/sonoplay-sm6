@@ -25,6 +25,21 @@ async def test_queue_folder_not_resent_on_timeout(fake_sm6):
 
 
 @pytest.mark.asyncio
+async def test_queue_folder_retried_after_stale_keepalive_disconnect(fake_sm6):
+    fake_sm6.disconnect_once_labels.add("QueueFolder")
+    sm6 = Sm6Control("http://192.168.50.99:8050/description.xml")
+
+    await sm6.queue_folder(
+        "<DIDL/>",
+        action="PLAY_NOW",
+        server_udn="uuid:plex",
+        navigator_id="nav",
+    )
+    assert fake_sm6._call_count.get("QueueFolder", 0) == 2
+    assert fake_sm6.transport == "PLAYING"
+
+
+@pytest.mark.asyncio
 async def test_idempotent_read_is_retried_on_timeout(fake_sm6):
     fake_sm6.timeout_labels.add("GetVolume")
     sm6 = Sm6Control("http://192.168.50.99:8050/description.xml")

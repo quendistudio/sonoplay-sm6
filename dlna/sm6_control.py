@@ -189,8 +189,13 @@ class Sm6Control:
                     return text
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 last_error = exc
-                # Non-idempotent actions: only a refused connection proves the SM6 never got it.
-                if not retry_on_timeout and not isinstance(exc, aiohttp.ClientConnectorError):
+                # Non-idempotent actions: retry only when the SM6 never got the request
+                # (refused connection, or stale keep-alive socket closed by the SM6).
+                # ponytail: a disconnect after the SM6 started executing would also be
+                # retried; not observed so far — gate on elapsed time if it ever is.
+                if not retry_on_timeout and not isinstance(
+                    exc, (aiohttp.ClientConnectorError, aiohttp.ServerDisconnectedError)
+                ):
                     break
         raise RuntimeError(f"{label} unavailable") from last_error
 
